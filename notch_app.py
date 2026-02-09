@@ -218,6 +218,8 @@ def analyze_image(
     top_slope=vy/vx if abs(vx)>1e-9 else float("inf")
     vx,vy,xz,yz=_fit_line_L2(pts_right)
     a_right,b_right,c_right=_line_params_abc(vx,vy,xz,yz)
+    right_angle_deg=_line_angle_deg(vx,vy)
+    right_slope=vy/vx if abs(vx)>1e-9 else float("inf")
     vx,vy,xz,yz=_fit_line_L2(pts_bottom)
     a_bottom,b_bottom,c_bottom=_line_params_abc(vx,vy,xz,yz)
     bottom_angle_deg=_line_angle_deg(vx,vy)
@@ -276,8 +278,9 @@ def analyze_image(
         "ru_area": ru_area, "rd_area": rd_area,
         "ru_result": ru_result, "rd_result": rd_result,
         "mask_diff": mask_diff, "ru_roi_mask": ru_mask, "rd_roi_mask": rd_mask,
-        "top_angle_deg": top_angle_deg, "bottom_angle_deg": bottom_angle_deg,
-        "top_slope": top_slope, "bottom_slope": bottom_slope
+        "top_angle_deg": top_angle_deg, "right_angle_deg": right_angle_deg,
+        "bottom_angle_deg": bottom_angle_deg, "top_slope": top_slope,
+        "right_slope": right_slope, "bottom_slope": bottom_slope
     }
 
 
@@ -1046,7 +1049,8 @@ class NotchApp(ttk.Window):
             csv_path=self._get_result_csv_path()
             header=["filename","folderpath","trim_ratio_x","trim_ratio_y","diff_thresh",
                     "band_top","band_right","band_bottom","corner_exclude_x_px","corner_exclude_y_px",
-                    "top_angle_deg","bottom_angle_deg","top_slope","bottom_slope",
+                    "top_angle_deg","right_angle_deg","bottom_angle_deg",
+                    "top_slope","right_slope","bottom_slope",
                     "ru_area","ru_result","rd_area","rd_result","result_img"]
             count_ok=0
             for path in self.file_paths:
@@ -1068,8 +1072,8 @@ class NotchApp(ttk.Window):
                          self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
                          self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
                          self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
-                         res["top_angle_deg"], res["bottom_angle_deg"],
-                         res["top_slope"], res["bottom_slope"],
+                         res["top_angle_deg"], res["right_angle_deg"], res["bottom_angle_deg"],
+                         res["top_slope"], res["right_slope"], res["bottom_slope"],
                          res["ru_area"], res["ru_result"], res["rd_area"], res["rd_result"],
                          out_path or ""]
                     self._append_result_csv(csv_path, header, row)
@@ -1088,6 +1092,7 @@ class NotchApp(ttk.Window):
               f"RU: {result_dict['ru_result']} ({result_dict['ru_area']}) | "
               f"RD: {result_dict['rd_result']} ({result_dict['rd_area']}) | "
               f"Top傾き: {result_dict['top_angle_deg']:.3f}° "
+              f"Right傾き: {result_dict['right_angle_deg']:.3f}° "
               f"Bottom傾き: {result_dict['bottom_angle_deg']:.3f}° | "
               f"trim=({self.trim_ratio_x.get():.2f},{self.trim_ratio_y.get():.2f}) "
               f"th={self.diff_thresh.get()} "
@@ -1306,7 +1311,8 @@ class NotchApp(ttk.Window):
                 csv_path=self._get_result_csv_path()
                 header=["filename","folderpath","trim_ratio_x","trim_ratio_y","diff_thresh",
                         "band_top","band_right","band_bottom","corner_exclude_x_px","corner_exclude_y_px",
-                        "top_angle_deg","bottom_angle_deg","top_slope","bottom_slope",
+                        "top_angle_deg","right_angle_deg","bottom_angle_deg",
+                        "top_slope","right_slope","bottom_slope",
                         "ru_area","ru_result","rd_area","rd_result","result_img"]
 
                 if ok_capture and img_tmp_path:
@@ -1332,8 +1338,8 @@ class NotchApp(ttk.Window):
                              self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
                              self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
                              self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
-                             res["top_angle_deg"], res["bottom_angle_deg"],
-                             res["top_slope"], res["bottom_slope"],
+                             res["top_angle_deg"], res["right_angle_deg"], res["bottom_angle_deg"],
+                             res["top_slope"], res["right_slope"], res["bottom_slope"],
                              res["ru_area"], res["ru_result"], res["rd_area"], res["rd_result"],
                              result_img_path or ""]
                         self._append_result_csv(csv_path, header, row)
@@ -1345,7 +1351,7 @@ class NotchApp(ttk.Window):
                              self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
                              self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
                              self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
-                             "", "", "", "",
+                             "", "", "", "", "", "",
                              -1, "ERROR_ANALYZE", -1, "ERROR_ANALYZE", ""]
                         self._append_result_csv(csv_path, header, row)
                 else:
@@ -1354,7 +1360,7 @@ class NotchApp(ttk.Window):
                          self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
                          self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
                          self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
-                         "", "", "", "",
+                         "", "", "", "", "", "",
                          -1, "ERROR_TIMEOUT" if (error_type=="TIMEOUT") else "ERROR_CAPTURE",
                          -1, "ERROR_TIMEOUT" if (error_type=="TIMEOUT") else "ERROR_CAPTURE",
                          ""]
