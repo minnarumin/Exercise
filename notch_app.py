@@ -23,7 +23,7 @@ import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from PIL import Image, ImageTk
 import csv, os, re, traceback, tempfile, time, json, glob, threading
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, fields
 from collections import deque
 
 # ====== オプション依存（存在チェック） ======
@@ -144,6 +144,10 @@ def _extract_edge_points(mask_real, band, side, exclude_x_px, exclude_y_px, bbox
         y_min=max(0,y0); y_max=max(0,min(y1, y0+band))
         sel=(y>=y_min)&(y<=y_max)
         sel&=(x>=x0+int(exclude_x_px))&(x<=x1-int(exclude_x_px))
+    elif side=='left':
+        x_max=min(x1, x0+band)
+        sel=(x>=x0)&(x<=x_max)
+        sel&=(y>=y0+int(exclude_y_px))&(y<=y1-int(exclude_y_px))
     elif side=='right':
         x_min=max(0, x1-band)
         sel=(x>=x_min)&(x<=x1)
@@ -153,7 +157,7 @@ def _extract_edge_points(mask_real, band, side, exclude_x_px, exclude_y_px, bbox
         sel=(y>=y_min)&(y<=y1)
         sel&=(x>=x0+int(exclude_x_px))&(x<=x1-int(exclude_x_px))
     else:
-        raise ValueError("side must be 'top'|'right'|'bottom'")
+        raise ValueError("side must be 'top'|'left'|'right'|'bottom'")
     xs=x[sel].astype(np.float32); ys=y[sel].astype(np.float32)
     if xs.size<50: return np.empty((0,2), np.float32)
     return np.stack([xs,ys], axis=1)
@@ -184,16 +188,41 @@ def _make_corner_rd(right_abc, bottom_abc, trim_x_px, trim_y_px, img_shape):
     h,w=img_shape[:2]
     return _clip_polygon_to_image(quad, w, h)
 
+def _make_corner_lu(top_abc, left_abc, trim_x_px, trim_y_px, img_shape):
+    a1,b1,c1=top_abc; a2,b2,c2=left_abc
+    P=_line_intersection(a1,b1,c1, a2,b2,c2)
+    if P is None: return np.empty((0,2), np.float32)
+    t_top=_unit(np.array([-b1,a1],np.float32))
+    t_left=_unit(np.array([-b2,a2],np.float32))
+    if t_top[0]<0: t_top=-t_top
+    if t_left[1]<0: t_left=-t_left
+    p0=P; p1=P+t_left*trim_y_px; p2=p1+t_top*trim_x_px; p3=P+t_top*trim_x_px
+    quad=np.array([p0,p1,p2,p3],np.float32)
+    h,w=img_shape[:2]
+    return _clip_polygon_to_image(quad, w, h)
+
+def _make_corner_ld(left_abc, bottom_abc, trim_x_px, trim_y_px, img_shape):
+    aL,bL,cL=left_abc; aB,bB,cB=bottom_abc
+    P=_line_intersection(aL,bL,cL, aB,bB,cB)
+    if P is None: return np.empty((0,2), np.float32)
+    t_bottom=_unit(np.array([-bB,aB],np.float32))
+    t_left =_unit(np.array([-bL,aL],np.float32))
+    if t_bottom[0]<0: t_bottom=-t_bottom
+    if t_left[1]<0:  t_left=-t_left
+    p0=P; p1=P+t_left*trim_y_px; p2=p1+t_bottom*trim_x_px; p3=P+t_bottom*trim_x_px
+    quad=np.array([p0,p1,p2,p3],np.float32)
+    h,w=img_shape[:2]
+    return _clip_polygon_to_image(quad, w, h)
+
 def analyze_image(
     filepath,
     trim_ratio_x=0.25, trim_ratio_y=0.12, diff_thresh=15000,
-    rotate_code=None, band_top=10, band_right=10, band_bottom=10,
+    notch_side="right",
+    band_top=10, band_right=10, band_bottom=10,
     corner_exclude_x_px=200, corner_exclude_y_px=25
 ):
     img = imread_unicode(filepath)
     if img is None: raise RuntimeError(f"画像の読み込みに失敗: {filepath}")
-    if rotate_code is not None:
-        img = cv2.rotate(img, rotate_code)
     gray=cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur=cv2.GaussianBlur(gray,(5,5),0)
     _,bin_img=cv2.threshold(blur,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
@@ -207,31 +236,38 @@ def analyze_image(
     x0,y0,bw,bh=cv2.boundingRect(main_cnt)
 
     pts_top   = _extract_edge_points(mask_real, band_top,   'top',    corner_exclude_x_px, corner_exclude_y_px,(x0,y0,bw,bh))
-    pts_right = _extract_edge_points(mask_real, band_right, 'right',  corner_exclude_x_px, corner_exclude_y_px,(x0,y0,bw,bh))
     pts_bottom= _extract_edge_points(mask_real, band_bottom,'bottom', corner_exclude_x_px, corner_exclude_y_px,(x0,y0,bw,bh))
-    if min(pts_top.shape[0], pts_right.shape[0], pts_bottom.shape[0]) < 50:
+    if notch_side == "left":
+        pts_side = _extract_edge_points(mask_real, band_right, 'left', corner_exclude_x_px, corner_exclude_y_px,(x0,y0,bw,bh))
+    else:
+        pts_side = _extract_edge_points(mask_real, band_right, 'right',  corner_exclude_x_px, corner_exclude_y_px,(x0,y0,bw,bh))
+    if min(pts_top.shape[0], pts_side.shape[0], pts_bottom.shape[0]) < 50:
         raise RuntimeError("線抽出点が不足しています。band_* や exclude_*、trim比を見直してください。")
 
     vx,vy,xz,yz=_fit_line_L2(pts_top)
     a_top,b_top,c_top=_line_params_abc(vx,vy,xz,yz)
     top_angle_deg=_line_angle_deg(vx,vy)
     top_slope=vy/vx if abs(vx)>1e-9 else float("inf")
-    vx,vy,xz,yz=_fit_line_L2(pts_right)
-    a_right,b_right,c_right=_line_params_abc(vx,vy,xz,yz)
-    right_angle_deg=_line_angle_deg(vx,vy)
-    right_slope=vy/vx if abs(vx)>1e-9 else float("inf")
+    vx,vy,xz,yz=_fit_line_L2(pts_side)
+    a_side,b_side,c_side=_line_params_abc(vx,vy,xz,yz)
+    side_angle_deg=_line_angle_deg(vx,vy)
+    side_slope=vy/vx if abs(vx)>1e-9 else float("inf")
     vx,vy,xz,yz=_fit_line_L2(pts_bottom)
     a_bottom,b_bottom,c_bottom=_line_params_abc(vx,vy,xz,yz)
     bottom_angle_deg=_line_angle_deg(vx,vy)
     bottom_slope=vy/vx if abs(vx)>1e-9 else float("inf")
 
     trim_x_px=rx*bw; trim_y_px=ry*bh
-    quad_ru=_make_corner_quad_from_lines((a_top,b_top,c_top),(a_right,b_right,c_right), trim_x_px,trim_y_px,img.shape)
-    quad_rd=_make_corner_rd((a_right,b_right,c_right),(a_bottom,b_bottom,c_bottom), trim_x_px,trim_y_px,img.shape)
+    if notch_side == "left":
+        quad_up=_make_corner_lu((a_top,b_top,c_top),(a_side,b_side,c_side), trim_x_px,trim_y_px,img.shape)
+        quad_down=_make_corner_ld((a_side,b_side,c_side),(a_bottom,b_bottom,c_bottom), trim_x_px,trim_y_px,img.shape)
+    else:
+        quad_up=_make_corner_quad_from_lines((a_top,b_top,c_top),(a_side,b_side,c_side), trim_x_px,trim_y_px,img.shape)
+        quad_down=_make_corner_rd((a_side,b_side,c_side),(a_bottom,b_bottom,c_bottom), trim_x_px,trim_y_px,img.shape)
 
     mask_rect=np.zeros_like(bin_inv)
-    if quad_ru.shape[0]>=3: cv2.fillPoly(mask_rect,[quad_ru.astype(np.int32)],255)
-    if quad_rd.shape[0]>=3: cv2.fillPoly(mask_rect,[quad_rd.astype(np.int32)],255)
+    if quad_up.shape[0]>=3: cv2.fillPoly(mask_rect,[quad_up.astype(np.int32)],255)
+    if quad_down.shape[0]>=3: cv2.fillPoly(mask_rect,[quad_down.astype(np.int32)],255)
     mask_diff=cv2.subtract(mask_rect, mask_real)
 
     def _area_quad(mask, quad):
@@ -240,8 +276,8 @@ def analyze_image(
         area=int(np.sum(cv2.bitwise_and(mask,roi)>128))
         return area, roi
 
-    ru_area, ru_mask = _area_quad(mask_diff, quad_ru)
-    rd_area, rd_mask = _area_quad(mask_diff, quad_rd)
+    ru_area, ru_mask = _area_quad(mask_diff, quad_up)
+    rd_area, rd_mask = _area_quad(mask_diff, quad_down)
     ru_result = "NOTCH" if ru_area>diff_thresh else "NO NOTCH"
     rd_result = "NOTCH" if rd_area>diff_thresh else "NO NOTCH"
 
@@ -258,29 +294,31 @@ def analyze_image(
         if len(pts_in)>=2: cv2.line(img, pts_in[0], pts_in[1], color, 2, cv2.LINE_AA)
 
     _draw_line(vis, a_top,b_top,c_top,         (0,255,0))
-    _draw_line(vis, a_right,b_right,c_right,   (255,0,255))
+    _draw_line(vis, a_side,b_side,c_side,      (255,0,255))
     _draw_line(vis, a_bottom,b_bottom,c_bottom,(0,255,255))
 
     vis_mask=vis.copy()
     vis_mask[mask_diff>128]=[0,255,255]
-    if quad_ru.shape[0]>=3: cv2.polylines(vis_mask,[quad_ru.astype(np.int32)],True,(0,0,255),3)
-    if quad_rd.shape[0]>=3: cv2.polylines(vis_mask,[quad_rd.astype(np.int32)],True,(255,0,0),3)
+    if quad_up.shape[0]>=3: cv2.polylines(vis_mask,[quad_up.astype(np.int32)],True,(0,0,255),3)
+    if quad_down.shape[0]>=3: cv2.polylines(vis_mask,[quad_down.astype(np.int32)],True,(255,0,0),3)
 
-    if quad_ru.shape[0]>=3:
-        P=np.mean(quad_ru, axis=0).astype(int)
+    if quad_up.shape[0]>=3:
+        P=np.mean(quad_up, axis=0).astype(int)
         cv2.putText(vis_mask, f"RU: {ru_result} ({ru_area})",(P[0]+5,P[1]+5),cv2.FONT_HERSHEY_SIMPLEX,1.1,(0,0,255),3)
-    if quad_rd.shape[0]>=3:
-        P=np.mean(quad_rd, axis=0).astype(int)
+    if quad_down.shape[0]>=3:
+        P=np.mean(quad_down, axis=0).astype(int)
         cv2.putText(vis_mask, f"RD: {rd_result} ({rd_area})",(P[0]+5,P[1]+5),cv2.FONT_HERSHEY_SIMPLEX,1.1,(255,0,0),3)
 
+    side_label = "Left" if notch_side == "left" else "Right"
     return {
         "img_bgr": vis_mask,
         "ru_area": ru_area, "rd_area": rd_area,
         "ru_result": ru_result, "rd_result": rd_result,
         "mask_diff": mask_diff, "ru_roi_mask": ru_mask, "rd_roi_mask": rd_mask,
-        "top_angle_deg": top_angle_deg, "right_angle_deg": right_angle_deg,
+        "top_angle_deg": top_angle_deg, "side_angle_deg": side_angle_deg,
         "bottom_angle_deg": bottom_angle_deg, "top_slope": top_slope,
-        "right_slope": right_slope, "bottom_slope": bottom_slope
+        "side_slope": side_slope, "bottom_slope": bottom_slope,
+        "side_label": side_label
     }
 
 
@@ -412,7 +450,7 @@ class AppConfig:
     corner_exclude_x_px:int = 200
     corner_exclude_y_px:int = 25
     auto_preview: bool = True
-    rotate_mode: str = "none"  # "none"|"cw90"|"ccw90"|"180"
+    notch_side: str = "right"  # "right"|"left"
 
     # 出力
     output_dir: str = ""
@@ -454,7 +492,9 @@ class AppConfig:
         try:
             with open(CONFIG_PATH,"r",encoding="utf-8") as f:
                 data=json.load(f)
-            return AppConfig(**data)
+            allowed = {item.name for item in fields(AppConfig)}
+            cleaned = {k: v for k, v in data.items() if k in allowed}
+            return AppConfig(**cleaned)
         except Exception:
             return AppConfig()
 
@@ -568,7 +608,6 @@ class NotchApp(ttk.Window):
         self._trace_lock=False
         self.file_paths=[]
         self.output_dir=self.cfg.output_dir
-        self.rotate_code=None
         self.last_sel_index=None
         self.basler=None
         self.last_result=None; self.last_result_path=None
@@ -589,6 +628,7 @@ class NotchApp(ttk.Window):
         self.corner_exclude_x_px=tk.IntVar(value=self.cfg.corner_exclude_x_px)
         self.corner_exclude_y_px=tk.IntVar(value=self.cfg.corner_exclude_y_px)
         self.auto_preview=tk.BooleanVar(value=self.cfg.auto_preview)
+        self.notch_side=tk.StringVar(value=self.cfg.notch_side)
 
         # PLC/カメラ/ハートビート用
         self.plc=PLCClient()
@@ -639,7 +679,6 @@ class NotchApp(ttk.Window):
         self._build_menu()
         self._build_ui()
         self._bind_traces()
-        self._apply_rotate_from_cfg()
         self._auto_cleanup_temp_files()
         self._post_status("起動完了。自動接続を試行します。")
 
@@ -718,21 +757,16 @@ class NotchApp(ttk.Window):
         ttk.Label(frm_params, text="diff_thresh:").grid(row=2, column=0, sticky="e")
         ttk.Spinbox(frm_params, from_=1, to=1000000, increment=50, textvariable=self.diff_thresh, width=10).grid(row=2, column=1, padx=4, pady=2)
 
-        ttk.Label(frm_params, text="回転:").grid(row=3, column=0, sticky="e")
+        ttk.Label(frm_params, text="ノッチ位置:").grid(row=3, column=0, sticky="e")
         cmb=ttk.Combobox(
             frm_params,
             state="readonly",
-            values=["回転なし","90° 時計回り","90° 反時計回り","180°"]
+            values=["右上/右下","左上/左下"]
         )
         cmb.grid(row=3, column=1, padx=4, pady=2, sticky="w")
-        mode=self.cfg.rotate_mode
-        cmb.set(
-            "回転なし" if mode=="none"
-            else "90° 時計回り" if mode=="cw90"
-            else "90° 反時計回り" if mode=="ccw90"
-            else "180°"
-        )
-        cmb.bind("<<ComboboxSelected>>", self.on_rotate_change)
+        mode=self.cfg.notch_side
+        cmb.set("右上/右下" if mode=="right" else "左上/左下")
+        cmb.bind("<<ComboboxSelected>>", self.on_notch_side_change)
 
         # 4) 直線近似パラメータ
         ttk.Label(left, text="4) 直線近似パラメータ").grid(row=8, column=0, sticky="w", pady=(12,2))
@@ -886,6 +920,7 @@ class NotchApp(ttk.Window):
             self.trim_ratio_x, self.trim_ratio_y, self.diff_thresh,
             self.band_top, self.band_right, self.band_bottom,
             self.corner_exclude_x_px, self.corner_exclude_y_px,
+            self.notch_side,
             self.auto_preview,  # ONにした瞬間にもプレビューしたい
         )
         # 保存のみ対象（PLC/HB/保存先 他）
@@ -935,6 +970,7 @@ class NotchApp(ttk.Window):
         self.cfg.corner_exclude_x_px=self.corner_exclude_x_px.get()
         self.cfg.corner_exclude_y_px=self.corner_exclude_y_px.get()
         self.cfg.auto_preview=bool(self.auto_preview.get())
+        self.cfg.notch_side=self.notch_side.get().strip() or "right"
         self.cfg.output_dir=self.output_dir or ""
         self.cfg.plc_ip=self.var_plc_ip.get().strip()
         self.cfg.plc_port=int(self.var_plc_port.get())
@@ -955,17 +991,6 @@ class NotchApp(ttk.Window):
         self.cfg.temp_max_files=int(self.temp_max_files.get())
         self.cfg.csv_max_records=int(self.csv_max_records.get())
         self.cfg.plc_shot_dir=self.var_plc_shot_dir.get().strip()
-
-    def _apply_rotate_from_cfg(self):
-        m=self.cfg.rotate_mode
-        if m == "none":
-            self.rotate_code = None
-        elif m == "cw90":
-            self.rotate_code = cv2.ROTATE_90_CLOCKWISE
-        elif m == "ccw90":
-            self.rotate_code = cv2.ROTATE_90_COUNTERCLOCKWISE
-        else:
-            self.rotate_code = cv2.ROTATE_180
 
     # ---------- 左ペイン操作 ----------
     def _on_listbox_select(self,_evt=None):
@@ -995,16 +1020,9 @@ class NotchApp(ttk.Window):
             self._sync_cfg_from_vars(); self.cfg.save()
             self._post_status(f"出力先を設定: {self.output_dir}")
 
-    def on_rotate_change(self, event=None):
+    def on_notch_side_change(self, event=None):
         val=event.widget.get()
-        if val=="90° 時計回り":
-            self.cfg.rotate_mode="cw90"; self.rotate_code=cv2.ROTATE_90_CLOCKWISE
-        elif val=="90° 反時計回り":
-            self.cfg.rotate_mode="ccw90"; self.rotate_code=cv2.ROTATE_90_COUNTERCLOCKWISE
-        elif val=="180°":
-            self.cfg.rotate_mode="180"; self.rotate_code=cv2.ROTATE_180
-        else:
-            self.cfg.rotate_mode="none"; self.rotate_code=None
+        self.cfg.notch_side="left" if val=="左上/左下" else "right"
         self.cfg.save()
         if self.auto_preview.get(): self.on_preview()
 
@@ -1031,7 +1049,7 @@ class NotchApp(ttk.Window):
                 trim_ratio_x=self.trim_ratio_x.get(),
                 trim_ratio_y=self.trim_ratio_y.get(),
                 diff_thresh=self.diff_thresh.get(),
-                rotate_code=self.rotate_code,
+                notch_side=self.notch_side.get(),
                 band_top=self.band_top.get(),
                 band_right=self.band_right.get(),
                 band_bottom=self.band_bottom.get(),
@@ -1047,10 +1065,10 @@ class NotchApp(ttk.Window):
             if not self.file_paths:
                 self._post_status("処理する画像が選択されていません"); return
             csv_path=self._get_result_csv_path()
-            header=["filename","folderpath","trim_ratio_x","trim_ratio_y","diff_thresh",
+            header=["filename","folderpath","trim_ratio_x","trim_ratio_y","diff_thresh","notch_side",
                     "band_top","band_right","band_bottom","corner_exclude_x_px","corner_exclude_y_px",
-                    "top_angle_deg","right_angle_deg","bottom_angle_deg",
-                    "top_slope","right_slope","bottom_slope",
+                    "top_angle_deg","side_angle_deg","bottom_angle_deg",
+                    "top_slope","side_slope","bottom_slope",
                     "ru_area","ru_result","rd_area","rd_result","result_img"]
             count_ok=0
             for path in self.file_paths:
@@ -1060,7 +1078,7 @@ class NotchApp(ttk.Window):
                         trim_ratio_x=self.trim_ratio_x.get(),
                         trim_ratio_y=self.trim_ratio_y.get(),
                         diff_thresh=self.diff_thresh.get(),
-                        rotate_code=self.rotate_code,
+                        notch_side=self.notch_side.get(),
                         band_top=self.band_top.get(),
                         band_right=self.band_right.get(),
                         band_bottom=self.band_bottom.get(),
@@ -1070,10 +1088,11 @@ class NotchApp(ttk.Window):
                     out_path=save_result_image(res["img_bgr"], path, self.output_dir)
                     row=[os.path.basename(path), os.path.dirname(path),
                          self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
+                         self.notch_side.get(),
                          self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
                          self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
-                         res["top_angle_deg"], res["right_angle_deg"], res["bottom_angle_deg"],
-                         res["top_slope"], res["right_slope"], res["bottom_slope"],
+                         res["top_angle_deg"], res["side_angle_deg"], res["bottom_angle_deg"],
+                         res["top_slope"], res["side_slope"], res["bottom_slope"],
                          res["ru_area"], res["ru_result"], res["rd_area"], res["rd_result"],
                          out_path or ""]
                     self._append_result_csv(csv_path, header, row)
@@ -1092,7 +1111,7 @@ class NotchApp(ttk.Window):
               f"RU: {result_dict['ru_result']} ({result_dict['ru_area']}) | "
               f"RD: {result_dict['rd_result']} ({result_dict['rd_area']}) | "
               f"Top傾き: {result_dict['top_angle_deg']:.3f}° "
-              f"Right傾き: {result_dict['right_angle_deg']:.3f}° "
+              f"{result_dict['side_label']}傾き: {result_dict['side_angle_deg']:.3f}° "
               f"Bottom傾き: {result_dict['bottom_angle_deg']:.3f}° | "
               f"trim=({self.trim_ratio_x.get():.2f},{self.trim_ratio_y.get():.2f}) "
               f"th={self.diff_thresh.get()} "
@@ -1193,8 +1212,6 @@ class NotchApp(ttk.Window):
             t0 = time.monotonic()
             try:
                 img_bgr = self._cam_snap_bgr()
-                if self.rotate_code is not None:
-                    img_bgr = cv2.rotate(img_bgr, self.rotate_code)
                 rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                 pil = Image.fromarray(rgb)
                 self.after(0, lambda im=pil: self.canvas.set_image(im))
@@ -1309,10 +1326,10 @@ class NotchApp(ttk.Window):
 
                 ru_notch=False; rd_notch=False; to_error=False; an_error=False
                 csv_path=self._get_result_csv_path()
-                header=["filename","folderpath","trim_ratio_x","trim_ratio_y","diff_thresh",
+                header=["filename","folderpath","trim_ratio_x","trim_ratio_y","diff_thresh","notch_side",
                         "band_top","band_right","band_bottom","corner_exclude_x_px","corner_exclude_y_px",
-                        "top_angle_deg","right_angle_deg","bottom_angle_deg",
-                        "top_slope","right_slope","bottom_slope",
+                        "top_angle_deg","side_angle_deg","bottom_angle_deg",
+                        "top_slope","side_slope","bottom_slope",
                         "ru_area","ru_result","rd_area","rd_result","result_img"]
 
                 if ok_capture and img_tmp_path:
@@ -1322,7 +1339,7 @@ class NotchApp(ttk.Window):
                             trim_ratio_x=self.trim_ratio_x.get(),
                             trim_ratio_y=self.trim_ratio_y.get(),
                             diff_thresh=self.diff_thresh.get(),
-                            rotate_code=self.rotate_code,
+                            notch_side=self.notch_side.get(),
                             band_top=self.band_top.get(),
                             band_right=self.band_right.get(),
                             band_bottom=self.band_bottom.get(),
@@ -1336,10 +1353,11 @@ class NotchApp(ttk.Window):
                         result_img_path = save_result_image(res["img_bgr"], img_tmp_path, self.output_dir or os.path.dirname(img_tmp_path))
                         row=[os.path.basename(img_tmp_path), os.path.dirname(img_tmp_path),
                              self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
+                             self.notch_side.get(),
                              self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
                              self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
-                             res["top_angle_deg"], res["right_angle_deg"], res["bottom_angle_deg"],
-                             res["top_slope"], res["right_slope"], res["bottom_slope"],
+                             res["top_angle_deg"], res["side_angle_deg"], res["bottom_angle_deg"],
+                             res["top_slope"], res["side_slope"], res["bottom_slope"],
                              res["ru_area"], res["ru_result"], res["rd_area"], res["rd_result"],
                              result_img_path or ""]
                         self._append_result_csv(csv_path, header, row)
@@ -1349,6 +1367,7 @@ class NotchApp(ttk.Window):
                         row=[os.path.basename(img_tmp_path) if img_tmp_path else "",
                              os.path.dirname(img_tmp_path) if img_tmp_path else "",
                              self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
+                             self.notch_side.get(),
                              self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
                              self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
                              "", "", "", "", "", "",
@@ -1358,6 +1377,7 @@ class NotchApp(ttk.Window):
                     to_error=True
                     row=["", self.cfg.plc_shot_dir or tempfile.gettempdir(),
                          self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
+                         self.notch_side.get(),
                          self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
                          self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
                          "", "", "", "", "", "",
