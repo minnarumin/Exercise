@@ -119,6 +119,19 @@ def _line_intersection(a1,b1,c1, a2,b2,c2):
     y = (c1*a2 - c2*a1)/d
     return np.array([x,y], np.float32)
 
+def _line_endpoints(a, b, c, width, height):
+    pts=[]
+    if abs(b)>1e-9:
+        for X in (0, width-1):
+            Y=int(round(-(a*X+c)/b)); pts.append((X,Y))
+    if abs(a)>1e-9:
+        for Y in (0, height-1):
+            X=int(round(-(b*Y+c)/a)); pts.append((X,Y))
+    pts_in=[p for p in pts if 0<=p[0]<width and 0<=p[1]<height]
+    if len(pts_in)>=2:
+        return pts_in[0], pts_in[1]
+    return None, None
+
 def _unit(v):
     n = np.linalg.norm(v)
     return v/n if n>1e-9 else v
@@ -315,6 +328,11 @@ def analyze_image(
         pts_in=[p for p in pts if 0<=p[0]<ww and 0<=p[1]<hh]
         if len(pts_in)>=2: cv2.line(img, pts_in[0], pts_in[1], color, 2, cv2.LINE_AA)
 
+    hh, ww = img.shape[:2]
+    top_p1, top_p2 = _line_endpoints(a_top, b_top, c_top, ww, hh)
+    side_p1, side_p2 = _line_endpoints(a_side, b_side, c_side, ww, hh)
+    bottom_p1, bottom_p2 = _line_endpoints(a_bottom, b_bottom, c_bottom, ww, hh)
+
     _draw_line(vis, a_top,b_top,c_top,         (0,255,0))
     _draw_line(vis, a_side,b_side,c_side,      (255,0,255))
     _draw_line(vis, a_bottom,b_bottom,c_bottom,(0,255,255))
@@ -340,7 +358,10 @@ def analyze_image(
         "top_angle_deg": top_angle_deg, "side_angle_deg": side_angle_deg,
         "bottom_angle_deg": bottom_angle_deg, "top_slope": top_slope,
         "side_slope": side_slope, "bottom_slope": bottom_slope,
-        "side_label": side_label
+        "side_label": side_label,
+        "top_line": (top_p1, top_p2),
+        "side_line": (side_p1, side_p2),
+        "bottom_line": (bottom_p1, bottom_p2)
     }
 
 
@@ -1156,12 +1177,18 @@ class NotchApp(ttk.Window):
         bgr=result_dict["img_bgr"]; rgb=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         self.canvas.set_image(Image.fromarray(rgb))
         self.zoom_label.config(text=f"{self.canvas.zoom*100:.0f}%")
+        top_p1, top_p2 = result_dict["top_line"]
+        side_p1, side_p2 = result_dict["side_line"]
+        bottom_p1, bottom_p2 = result_dict["bottom_line"]
         info=(f"ファイル: {os.path.basename(path)} | "
               f"RU: {result_dict['ru_result']} ({result_dict['ru_area']}) | "
               f"RD: {result_dict['rd_result']} ({result_dict['rd_area']}) | "
               f"Top傾き: {result_dict['top_angle_deg']:.3f}° "
               f"{result_dict['side_label']}傾き: {result_dict['side_angle_deg']:.3f}° "
               f"Bottom傾き: {result_dict['bottom_angle_deg']:.3f}° | "
+              f"Top線: {top_p1}->{top_p2} "
+              f"{result_dict['side_label']}線: {side_p1}->{side_p2} "
+              f"Bottom線: {bottom_p1}->{bottom_p2} | "
               f"trim=({self.trim_ratio_x.get():.2f},{self.trim_ratio_y.get():.2f}) "
               f"th={self.diff_thresh.get()} "
               f"[bands=({self.band_top.get()},{self.band_right.get()},{self.band_bottom.get()}), "
