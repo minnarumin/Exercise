@@ -409,7 +409,7 @@ class AppConfig:
     corner_exclude_x_px:int = 200
     corner_exclude_y_px:int = 25
     auto_preview: bool = True
-    rotate_mode: str = "none"  # "none"|"cw90"|"ccw90"
+    rotate_mode: str = "none"  # "none"|"cw90"|"ccw90"|"180"
 
     # 出力
     output_dir: str = ""
@@ -716,10 +716,19 @@ class NotchApp(ttk.Window):
         ttk.Spinbox(frm_params, from_=1, to=1000000, increment=50, textvariable=self.diff_thresh, width=10).grid(row=2, column=1, padx=4, pady=2)
 
         ttk.Label(frm_params, text="回転:").grid(row=3, column=0, sticky="e")
-        cmb=ttk.Combobox(frm_params, state="readonly", values=["回転なし","90° 時計回り","90° 反時計回り"])
+        cmb=ttk.Combobox(
+            frm_params,
+            state="readonly",
+            values=["回転なし","90° 時計回り","90° 反時計回り","180°"]
+        )
         cmb.grid(row=3, column=1, padx=4, pady=2, sticky="w")
         mode=self.cfg.rotate_mode
-        cmb.set("回転なし" if mode=="none" else "90° 時計回り" if mode=="cw90" else "90° 反時計回り")
+        cmb.set(
+            "回転なし" if mode=="none"
+            else "90° 時計回り" if mode=="cw90"
+            else "90° 反時計回り" if mode=="ccw90"
+            else "180°"
+        )
         cmb.bind("<<ComboboxSelected>>", self.on_rotate_change)
 
         # 4) 直線近似パラメータ
@@ -946,7 +955,14 @@ class NotchApp(ttk.Window):
 
     def _apply_rotate_from_cfg(self):
         m=self.cfg.rotate_mode
-        self.rotate_code=None if m=="none" else (cv2.ROTATE_90_CLOCKWISE if m=="cw90" else cv2.ROTATE_90_COUNTERCLOCKWISE)
+        if m == "none":
+            self.rotate_code = None
+        elif m == "cw90":
+            self.rotate_code = cv2.ROTATE_90_CLOCKWISE
+        elif m == "ccw90":
+            self.rotate_code = cv2.ROTATE_90_COUNTERCLOCKWISE
+        else:
+            self.rotate_code = cv2.ROTATE_180
 
     # ---------- 左ペイン操作 ----------
     def _on_listbox_select(self,_evt=None):
@@ -982,6 +998,8 @@ class NotchApp(ttk.Window):
             self.cfg.rotate_mode="cw90"; self.rotate_code=cv2.ROTATE_90_CLOCKWISE
         elif val=="90° 反時計回り":
             self.cfg.rotate_mode="ccw90"; self.rotate_code=cv2.ROTATE_90_COUNTERCLOCKWISE
+        elif val=="180°":
+            self.cfg.rotate_mode="180"; self.rotate_code=cv2.ROTATE_180
         else:
             self.cfg.rotate_mode="none"; self.rotate_code=None
         self.cfg.save()
