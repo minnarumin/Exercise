@@ -73,6 +73,28 @@ def save_result_image(img_bgr, src_filepath, out_dir):
     except Exception:
         return None
 
+def list_basler_devices():
+    if not HAS_PYLYON:
+        return []
+    try:
+        tlf=pylon.TlFactory.GetInstance()
+        devs=tlf.EnumerateDevices()
+        results=[]
+        for idx, dev in enumerate(devs):
+            try:
+                model=dev.GetModelName()
+            except Exception:
+                model="Unknown"
+            try:
+                serial=dev.GetSerialNumber()
+            except Exception:
+                serial=""
+            label=f"{idx}: {model}" + (f" ({serial})" if serial else "")
+            results.append((idx, label))
+        return results
+    except Exception:
+        return []
+
 
 # ================== 画像処理（直線近似のみ） ==================
 def _fit_line_L2(points_xy):
@@ -455,6 +477,9 @@ class AppConfig:
     # 出力
     output_dir: str = ""
 
+    # カメラ設定
+    camera_index: int = 0
+
     # PLC 設定（メニューバーから編集）
     plc_ip: str = "192.168.1.2"
     plc_port: int = 1026
@@ -629,6 +654,7 @@ class NotchApp(ttk.Window):
         self.corner_exclude_y_px=tk.IntVar(value=self.cfg.corner_exclude_y_px)
         self.auto_preview=tk.BooleanVar(value=self.cfg.auto_preview)
         self.notch_side=tk.StringVar(value=self.cfg.notch_side)
+        self.var_camera_index=tk.IntVar(value=self.cfg.camera_index)
 
         # PLC/カメラ/ハートビート用
         self.plc=PLCClient()
@@ -693,6 +719,7 @@ class NotchApp(ttk.Window):
         m_settings=tk.Menu(menubar, tearoff=False)
         menubar.add_cascade(label="設定", menu=m_settings)
         m_settings.add_command(label="PLC連携…", command=self._open_plc_settings)
+        m_settings.add_command(label="カメラ設定…", command=self._open_camera_settings)
         m_settings.add_command(label="生存カウンタ…", command=self._open_hb_settings)
         m_settings.add_command(label="一時ファイル管理…", command=self._open_temp_settings)
         m_settings.add_command(label="結果CSV/保存先…", command=self._open_result_settings)
@@ -871,6 +898,26 @@ class NotchApp(ttk.Window):
         self.var_plc_ip.trace_add("write", sync_target)
         self.var_plc_port.trace_add("write", sync_target)
 
+    def _open_camera_settings(self):
+        win=tk.Toplevel(self); win.title("カメラ設定"); win.transient(self); win.grab_set()
+        frm=ttk.Frame(win, padding=10); frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="接続するGigEカメラを選択してください。", bootstyle=INFO).pack(anchor="w")
+        devices=list_basler_devices()
+        if not devices:
+            ttk.Label(frm, text="カメラが検出できません。pypylonの導入や接続を確認してください。", bootstyle=WARNING).pack(anchor="w", pady=(8,0))
+            return
+        labels=[label for _idx, label in devices]
+        idx_map={label: idx for idx, label in devices}
+        cmb=ttk.Combobox(frm, state="readonly", values=labels)
+        current_label=next((label for idx, label in devices if idx==self.var_camera_index.get()), labels[0])
+        cmb.set(current_label)
+        cmb.pack(anchor="w", pady=(8,0))
+        def on_select(_event=None):
+            label=cmb.get()
+            self.var_camera_index.set(idx_map.get(label, 0))
+        cmb.bind("<<ComboboxSelected>>", on_select)
+        ttk.Label(frm, text="変更は即保存されます。", bootstyle=INFO).pack(anchor="w", pady=(8,0))
+
     def _open_hb_settings(self):
         win=tk.Toplevel(self); win.title("生存カウンタ 設定"); win.transient(self); win.grab_set()
         frm=ttk.Frame(win, padding=10); frm.pack(fill="both", expand=True)
@@ -929,7 +976,8 @@ class NotchApp(ttk.Window):
             self.var_dev_done, self.var_dev_busy, self.var_dev_err_to, self.var_dev_err_an,
             self.var_use_sw_trig, self.var_timeout_ms, self.var_done_ms,
             self.var_dev_alive, self.var_alive_ms, self.var_alive_step, self.var_alive_auto,
-            self.temp_max_files, self.csv_max_records, self.var_plc_shot_dir
+            self.temp_max_files, self.csv_max_records, self.var_plc_shot_dir,
+            self.var_camera_index
         )
 
         def bind_with_preview(v):
@@ -971,6 +1019,7 @@ class NotchApp(ttk.Window):
         self.cfg.corner_exclude_y_px=self.corner_exclude_y_px.get()
         self.cfg.auto_preview=bool(self.auto_preview.get())
         self.cfg.notch_side=self.notch_side.get().strip() or "right"
+        self.cfg.camera_index=int(self.var_camera_index.get())
         self.cfg.output_dir=self.output_dir or ""
         self.cfg.plc_ip=self.var_plc_ip.get().strip()
         self.cfg.plc_port=int(self.var_plc_port.get())
@@ -1124,7 +1173,7 @@ class NotchApp(ttk.Window):
     def _cam_open_if_needed(self):
         with self._cam_lock:
             if self.basler is None:
-                self.basler = BaslerCamera(device_index=0, timeout_ms=self.var_timeout_ms.get())
+                self.basler = BaslerCamera(device_index=self.var_camera_index.get(), timeout_ms=self.var_timeout_ms.get())
                 self.basler.open()
             else:
                 if not self.basler.is_healthy():
