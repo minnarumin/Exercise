@@ -400,10 +400,12 @@ def analyze_image(
 
 # ================== デバイス薄ラッパ ==================
 class BaslerCamera:
-    def __init__(self, device_index=0, timeout_ms=3000):
+    def __init__(self, device_index=0, timeout_ms=3000, idle_reopen_sec=900):
         self.device_index=device_index
         self.timeout_ms=timeout_ms
+        self.idle_reopen_sec=max(0, int(idle_reopen_sec))
         self.cam=None; self.converter=None
+        self.last_snap_monotonic=0.0
 
     def open(self):
         if not HAS_PYLYON: raise RuntimeError("pypylon 未導入")
@@ -450,24 +452,52 @@ class BaslerCamera:
         self.cam=None
         self.converter=None
 
+    def _reopen_if_idle(self):
+        if self.idle_reopen_sec <= 0:
+            return
+        now=time.monotonic()
+        if self.last_snap_monotonic > 0 and (now - self.last_snap_monotonic) >= float(self.idle_reopen_sec):
+            LOGGER.info("Camera idle for %.1fs, reopen before next snap", (now - self.last_snap_monotonic))
+            self.reopen()
+
     def snap_bgr(self):
-        if not self.is_open():
-            self.open()
-        self._start_grabbing_if_needed()
-        try:
-            self.cam.TriggerSoftware.Execute()
-        except Exception:
-            pass
-        res=self.cam.RetrieveResult(self.timeout_ms, pylon.TimeoutHandling_Return)
-        if res is None or not res.GrabSucceeded():
-            if res is not None: res.Release()
-            raise RuntimeError("画像取得に失敗")
-        try:
-            image=self.converter.Convert(res)
-            img=image.GetArray()
-            return img
-        finally:
-            res.Release()
+        self._reopen_if_idle()
+        last_err=None
+        for attempt in range(2):
+            if not self.is_open():
+                self.open()
+            self._start_grabbing_if_needed()
+            res=None
+            try:
+                try:
+                    self.cam.TriggerSoftware.Execute()
+                except Exception:
+                    pass
+                res=self.cam.RetrieveResult(self.timeout_ms, pylon.TimeoutHandling_Return)
+                if res is None or not res.GrabSucceeded():
+                    raise RuntimeError("画像取得に失敗")
+                image=self.converter.Convert(res)
+                img=image.GetArray()
+                self.last_snap_monotonic=time.monotonic()
+                return img
+            except Exception as e:
+                last_err=e
+                LOGGER.warning("Camera snap attempt %d failed: %s", attempt + 1, e)
+                if attempt == 0:
+                    try:
+                        self.reopen()
+                    except Exception as re:
+                        LOGGER.warning("Camera reopen after snap failure failed: %s", re)
+                        self.cam=None
+                else:
+                    break
+            finally:
+                try:
+                    if res is not None:
+                        res.Release()
+                except Exception:
+                    pass
+        raise RuntimeError(f"画像取得に失敗: {last_err}")
 
     def __del__(self):
         self.close()
@@ -690,6 +720,10 @@ class NotchApp(ttk.Window):
         self.last_sel_index=None
         self.basler=None
         self.last_result=None; self.last_result_path=None
+
+        # 長時間運用向け安定化パラメータ
+        self.cam_idle_reopen_sec = 900
+        self.plc_read_error_threshold = 10
 
         # カメラ排他ロック
         self._cam_lock = threading.RLock()
@@ -1240,11 +1274,25 @@ class NotchApp(ttk.Window):
     # ---------- カメラ共通ヘルパ（スレッド安全） ----------
     def _cam_open_if_needed(self):
         with self._cam_lock:
+            desired_idx = int(self.var_camera_index.get())
+            desired_timeout = int(self.var_timeout_ms.get())
             if self.basler is None:
-                self.basler = BaslerCamera(device_index=self.var_camera_index.get(), timeout_ms=self.var_timeout_ms.get())
+                self.basler = BaslerCamera(
+                    device_index=desired_idx,
+                    timeout_ms=desired_timeout,
+                    idle_reopen_sec=self.cam_idle_reopen_sec
+                )
                 self.basler.open()
             else:
+                need_reopen=False
+                if self.basler.device_index != desired_idx:
+                    self.basler.device_index = desired_idx
+                    need_reopen=True
+                self.basler.timeout_ms = desired_timeout
+                self.basler.idle_reopen_sec = self.cam_idle_reopen_sec
                 if not self.basler.is_healthy():
+                    need_reopen=True
+                if need_reopen:
                     self.basler.reopen()
             return self.basler
 
@@ -1405,11 +1453,23 @@ class NotchApp(ttk.Window):
 
     def _plc_loop(self):
         poll=0.01
+        read_err_count=0
         while not self.plc_stop:
             try:
                 trig=self.plc.read_bit(self.var_dev_trig.get().strip())
+                read_err_count=0
             except Exception as e:
-                self._post_status(f"PLC読取エラー: {e}")
+                read_err_count += 1
+                self._post_status(f"PLC読取エラー: {e} (連続{read_err_count}回)")
+                if read_err_count >= int(self.plc_read_error_threshold):
+                    self._post_status("PLC読取エラー多発のため監視を再起動します")
+                    try:
+                        if self.plc:
+                            self.plc.close()
+                    except Exception:
+                        LOGGER.exception("Failed to close PLC on repeated read errors")
+                    self.plc_connected=False
+                    break
                 time.sleep(0.2); continue
 
             if trig and not self.prev_trig:
