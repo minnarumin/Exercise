@@ -869,11 +869,22 @@ class NotchApp(ttk.Window):
         self.preview_area.rowconfigure(0, weight=1); self.preview_area.columnconfigure(0, weight=1)
         self.canvas=ZoomPanCanvas(self.preview_area, bg="#222"); self.canvas.grid(row=0, column=0, sticky="nsew")
 
-        # ステータス（最新5行固定）
-        logframe=ttk.Frame(right); logframe.grid(row=3, column=0, sticky="we", pady=(6,0))
+        # ステータス & 解析結果（並列）
+        info_row=ttk.Frame(right); info_row.grid(row=3, column=0, sticky="we", pady=(6,0))
+        info_row.columnconfigure(0, weight=1)
+        info_row.columnconfigure(1, weight=3)
+
+        logframe=ttk.Frame(info_row)
+        logframe.grid(row=0, column=0, sticky="nsew", padx=(0,6))
         ttk.Label(logframe, text="ステータス（最新5件）", bootstyle=INFO).pack(anchor="w")
-        self.txt_log=tk.Text(logframe, height=5, state="disabled", wrap="none")
-        self.txt_log.pack(fill="x")
+        self.txt_log=tk.Text(logframe, height=5, width=36, state="disabled", wrap="none")
+        self.txt_log.pack(fill="both", expand=True)
+
+        resultframe=ttk.Frame(info_row)
+        resultframe.grid(row=0, column=1, sticky="nsew")
+        ttk.Label(resultframe, text="解析結果", bootstyle=INFO).pack(anchor="w")
+        self.txt_result=tk.Text(resultframe, height=5, state="disabled", wrap="word")
+        self.txt_result.pack(fill="both", expand=True)
 
         self.canvas.bind("<Configure>", lambda _e: self.zoom_label.config(text=f"{self.canvas.zoom*100:.0f}%"))
 
@@ -1180,20 +1191,30 @@ class NotchApp(ttk.Window):
         top_p1, top_p2 = result_dict["top_line"]
         side_p1, side_p2 = result_dict["side_line"]
         bottom_p1, bottom_p2 = result_dict["bottom_line"]
-        info=(f"ファイル: {os.path.basename(path)} | "
-              f"RU: {result_dict['ru_result']} ({result_dict['ru_area']}) | "
-              f"RD: {result_dict['rd_result']} ({result_dict['rd_area']}) | "
-              f"Top傾き: {result_dict['top_angle_deg']:.3f}° "
-              f"{result_dict['side_label']}傾き: {result_dict['side_angle_deg']:.3f}° "
-              f"Bottom傾き: {result_dict['bottom_angle_deg']:.3f}° | "
-              f"Top線: {top_p1}->{top_p2} "
-              f"{result_dict['side_label']}線: {side_p1}->{side_p2} "
-              f"Bottom線: {bottom_p1}->{bottom_p2} | "
-              f"trim=({self.trim_ratio_x.get():.2f},{self.trim_ratio_y.get():.2f}) "
-              f"th={self.diff_thresh.get()} "
-              f"[bands=({self.band_top.get()},{self.band_right.get()},{self.band_bottom.get()}), "
-              f"exclude=({self.corner_exclude_x_px.get()},{self.corner_exclude_y_px.get()})]")
-        self._post_status(info)
+        result_lines=[
+            f"ファイル: {os.path.basename(path)}",
+            f"RU: {result_dict['ru_result']} ({result_dict['ru_area']})",
+            f"RD: {result_dict['rd_result']} ({result_dict['rd_area']})",
+            f"Top傾き: {result_dict['top_angle_deg']:.3f}°",
+            f"{result_dict['side_label']}傾き: {result_dict['side_angle_deg']:.3f}°",
+            f"Bottom傾き: {result_dict['bottom_angle_deg']:.3f}°",
+            f"Top線: {top_p1}->{top_p2}",
+            f"{result_dict['side_label']}線: {side_p1}->{side_p2}",
+            f"Bottom線: {bottom_p1}->{bottom_p2}",
+            f"trim=({self.trim_ratio_x.get():.2f},{self.trim_ratio_y.get():.2f}) th={self.diff_thresh.get()}",
+            f"bands=({self.band_top.get()},{self.band_right.get()},{self.band_bottom.get()}) "
+            f"exclude=({self.corner_exclude_x_px.get()},{self.corner_exclude_y_px.get()})"
+        ]
+        def _update_result():
+            self.txt_result.configure(state="normal")
+            self.txt_result.delete("1.0", "end")
+            self.txt_result.insert("1.0", "\n".join(result_lines))
+            self.txt_result.configure(state="disabled")
+        try:
+            self.after(0, _update_result)
+        except Exception:
+            pass
+        self._post_status("解析結果を更新しました。")
         self.last_result=result_dict; self.last_result_path=path
 
     # ---------- カメラ共通ヘルパ（スレッド安全） ----------
