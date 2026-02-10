@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 notch_app.py を初学者向けに要点コメント付きで読みやすくした版。
-※全行ではなく、重要な処理ブロックに絞ってコメントを追加しています。
+※関数ごとに「何をしているか」を具体的に説明するコメントを追加。
 """
 
 # -*- coding: utf-8 -*-
@@ -48,12 +48,12 @@ except Exception:
 
 # 解説: ここから大きな処理ブロック
 # ================== 低レベルユーティリティ ==================
-# 解説: 関数 `imread_unicode` の処理開始
+# 解説: 日本語パスを含む画像ファイルを安全に読み込み、BGR画像として返します。
 def imread_unicode(filename):
     data = np.fromfile(filename, dtype=np.uint8)
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
-# 解説: 関数 `save_to_csv` の処理開始
+# 解説: CSVファイルへヘッダ付きで1行追記し、必要なら保存先フォルダを自動作成します。
 def save_to_csv(csv_path, row, header=None):
     d = os.path.dirname(csv_path)
     if d: os.makedirs(d, exist_ok=True)
@@ -64,11 +64,11 @@ def save_to_csv(csv_path, row, header=None):
             w.writerow(header)
         w.writerow(row)
 
-# 解説: 関数 `safe_filename` の処理開始
+# 解説: ファイル名に使えない文字をアンダースコアへ置換して安全化します。
 def safe_filename(name):
     return re.sub(r'[\\/:*?"<>|]', "_", name)
 
-# 解説: 関数 `save_result_image` の処理開始
+# 解説: 解析済み画像をPNG保存し、保存先パスを返します（失敗時はNone）。
 def save_result_image(img_bgr, src_filepath, out_dir):
     try:
         filename_only = os.path.basename(src_filepath)
@@ -84,7 +84,7 @@ def save_result_image(img_bgr, src_filepath, out_dir):
     except Exception:
         return None
 
-# 解説: 関数 `list_basler_devices` の処理開始
+# 解説: 接続中Baslerデバイスを列挙し、UI表示用ラベル付きで返します。
 def list_basler_devices():
     if not HAS_PYLYON:
         return []
@@ -110,13 +110,13 @@ def list_basler_devices():
 
 # 解説: ここから大きな処理ブロック
 # ================== 画像処理（直線近似のみ） ==================
-# 解説: 関数 `_fit_line_L2` の処理開始
+# 解説: 点群に対して最小二乗法で直線近似し、方向ベクトルと通過点を返します。
 def _fit_line_L2(points_xy):
     pts = points_xy.astype(np.float32).reshape(-1,1,2)
     vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
     return float(vx), float(vy), float(x0), float(y0)
 
-# 解説: 関数 `_line_params_abc` の処理開始
+# 解説: 直線の方向表現を ax+by+c=0 形式へ正規化変換します。
 def _line_params_abc(vx, vy, x0, y0):
     a, b = vy, -vx
     c = -(a*x0 + b*y0)
@@ -124,11 +124,11 @@ def _line_params_abc(vx, vy, x0, y0):
     if s == 0: return 0.0, 0.0, 0.0
     return a/s, b/s, c/s
 
-# 解説: 関数 `_line_angle_deg` の処理開始
+# 解説: 直線方向ベクトルから角度（度）を計算します。
 def _line_angle_deg(vx, vy):
     return float(np.degrees(np.arctan2(vy, vx)))
 
-# 解説: 関数 `_line_intersection` の処理開始
+# 解説: 2直線の交点を計算し、平行時はNoneを返します。
 def _line_intersection(a1,b1,c1, a2,b2,c2):
     d = a1*b2 - a2*b1
     if abs(d) < 1e-9: return None
@@ -136,7 +136,7 @@ def _line_intersection(a1,b1,c1, a2,b2,c2):
     y = (c1*a2 - c2*a1)/d
     return np.array([x,y], np.float32)
 
-# 解説: 関数 `_line_endpoints` の処理開始
+# 解説: 画像枠との交差から描画用の始点/終点座標を求めます。
 def _line_endpoints(a, b, c, width, height):
     pts=[]
     if abs(b)>1e-9:
@@ -150,14 +150,14 @@ def _line_endpoints(a, b, c, width, height):
         return pts_in[0], pts_in[1]
     return None, None
 
-# 解説: 関数 `_unit` の処理開始
+# 解説: ベクトルを単位ベクトル化します（ゼロ割は回避）。
 def _unit(v):
     n = np.linalg.norm(v)
     return v/n if n>1e-9 else v
 
-# 解説: 関数 `_clip_polygon_to_image` の処理開始
+# 解説: 多角形を画像範囲内にクリッピングして有効頂点を返します。
 def _clip_polygon_to_image(poly_pts, w, h):
-    # 解説: 関数 `intersection` の処理開始
+    # 解説: 関数 `intersection` の処理を担当します。
     def intersection(A,B,edge):
         Ax,Ay = A; Bx,By = B
         if edge is left:
@@ -169,7 +169,7 @@ def _clip_polygon_to_image(poly_pts, w, h):
         if edge is bottom:
             t=((h-1)-Ay)/(By-Ay+1e-12); return np.array([Ax+t*(Bx-Ax), h-1], np.float32)
 
-    # 解説: 関数 `clip_edge` の処理開始
+    # 解説: 関数 `clip_edge` の処理を担当します。
     def clip_edge(points, edge):
         res=[]
         for i in range(len(points)):
@@ -191,7 +191,7 @@ def _clip_polygon_to_image(poly_pts, w, h):
         pts = clip_edge(pts, edge)
     return np.array(pts, np.float32) if len(pts)>=3 else np.empty((0,2), np.float32)
 
-# 解説: 関数 `_extract_edge_points` の処理開始
+# 解説: 指定辺（上/右/下）付近のエッジ点群を抽出します。
 def _extract_edge_points(mask_real, band, side, exclude_x_px, exclude_y_px, bbox):
     edges=cv2.Canny(mask_real, 50, 150)
     y_idx, x_idx = np.where(edges>0)
@@ -216,7 +216,7 @@ def _extract_edge_points(mask_real, band, side, exclude_x_px, exclude_y_px, bbox
     if xs.size<50: return np.empty((0,2), np.float32)
     return np.stack([xs,ys], axis=1)
 
-# 解説: 関数 `_make_corner_quad_from_lines` の処理開始
+# 解説: 上辺×右辺の交点から右上コーナー評価領域を作成します。
 def _make_corner_quad_from_lines(top_abc, right_abc, trim_x_px, trim_y_px, img_shape):
     a1,b1,c1=top_abc; a2,b2,c2=right_abc
     P=_line_intersection(a1,b1,c1, a2,b2,c2)
@@ -230,7 +230,7 @@ def _make_corner_quad_from_lines(top_abc, right_abc, trim_x_px, trim_y_px, img_s
     h,w=img_shape[:2]
     return _clip_polygon_to_image(quad, w, h)
 
-# 解説: 関数 `_make_corner_rd` の処理開始
+# 解説: 右辺×下辺の交点から右下コーナー評価領域を作成します。
 def _make_corner_rd(right_abc, bottom_abc, trim_x_px, trim_y_px, img_shape):
     aR,bR,cR=right_abc; aB,bB,cB=bottom_abc
     P=_line_intersection(aR,bR,cR, aB,bB,cB)
@@ -244,7 +244,7 @@ def _make_corner_rd(right_abc, bottom_abc, trim_x_px, trim_y_px, img_shape):
     h,w=img_shape[:2]
     return _clip_polygon_to_image(quad, w, h)
 
-# 解説: 関数 `analyze_image` の処理開始
+# 解説: 1枚画像を解析し、ノッチ判定・角度・可視化画像などをまとめて返します。
 def analyze_image(
     filepath,
     trim_ratio_x=0.25, trim_ratio_y=0.12, diff_thresh=15000,
@@ -296,7 +296,7 @@ def analyze_image(
     if quad_down.shape[0]>=3: cv2.fillPoly(mask_rect,[quad_down.astype(np.int32)],255)
     mask_diff=cv2.subtract(mask_rect, mask_real)
 
-    # 解説: 関数 `_area_quad` の処理開始
+    # 解説: 関数 `_area_quad` の処理を担当します。
     def _area_quad(mask, quad):
         if quad.shape[0]<3: return 0, np.zeros_like(mask)
         roi=np.zeros_like(mask); cv2.fillPoly(roi,[quad.astype(np.int32)],255)
@@ -309,7 +309,7 @@ def analyze_image(
     rd_result = "NOTCH" if rd_area>diff_thresh else "NO NOTCH"
 
     vis=img.copy()
-    # 解説: 関数 `_draw_line` の処理開始
+    # 解説: 関数 `_draw_line` の処理を担当します。
     def _draw_line(img,a,b,c,color):
         hh,ww=img.shape[:2]; pts=[]
         if abs(b)>1e-9:
@@ -364,15 +364,15 @@ def analyze_image(
 
 # 解説: ここから大きな処理ブロック
 # ================== デバイス薄ラッパ ==================
-# 解説: クラス `BaslerCamera` の定義
+# 解説: クラス `BaslerCamera` の定義（関連する状態と処理をまとめる単位）
 class BaslerCamera:
-    # 解説: 関数 `__init__` の処理開始
+    # 解説: 関数 `__init__` の処理を担当します。
     def __init__(self, device_index=0, timeout_ms=3000):
         self.device_index=device_index
         self.timeout_ms=timeout_ms
         self.cam=None; self.converter=None
 
-    # 解説: 関数 `open` の処理開始
+    # 解説: デバイス/通信を初期化して接続を確立します。
     def open(self):
         if not HAS_PYLYON: raise RuntimeError("pypylon 未導入")
         tlf=pylon.TlFactory.GetInstance()
@@ -394,25 +394,25 @@ class BaslerCamera:
             pass
         self._start_grabbing_if_needed()
 
-    # 解説: 関数 `_start_grabbing_if_needed` の処理開始
+    # 解説: カメラのGrabが止まっていれば開始します。
     def _start_grabbing_if_needed(self):
         if self.cam and (not self.cam.IsGrabbing()):
             self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
 
-    # 解説: 関数 `is_open` の処理開始
+    # 解説: リソースがオープン状態かどうかを返します。
     def is_open(self):
         return bool(self.cam and self.cam.IsOpen())
 
-    # 解説: 関数 `is_healthy` の処理開始
+    # 解説: 接続健全性を返します（基本はオープン状態判定）。
     def is_healthy(self):
         return self.is_open()
 
-    # 解説: 関数 `reopen` の処理開始
+    # 解説: 接続を閉じて再接続します。
     def reopen(self):
         self.close()
         self.open()
 
-    # 解説: 関数 `close` の処理開始
+    # 解説: カメラ/PLC接続を安全にクローズします。
     def close(self):
         try:
             if self.cam:
@@ -423,7 +423,7 @@ class BaslerCamera:
         self.cam=None
         self.converter=None
 
-    # 解説: 関数 `snap_bgr` の処理開始
+    # 解説: Baslerから1フレーム取得してBGR画像を返します。
     def snap_bgr(self):
         if not self.is_open():
             self.open()
@@ -443,24 +443,24 @@ class BaslerCamera:
         finally:
             res.Release()
 
-    # 解説: 関数 `__del__` の処理開始
+    # 解説: オブジェクト破棄時にリソースを解放します。
     def __del__(self):
         self.close()
 
 
-# 解説: クラス `PLCClient` の定義
+# 解説: クラス `PLCClient` の定義（関連する状態と処理をまとめる単位）
 class PLCClient:
-    # 解説: 関数 `__init__` の処理開始
+    # 解説: 関数 `__init__` の処理を担当します。
     def __init__(self):
         self.cli=None
 
-    # 解説: 関数 `connect` の処理開始
+    # 解説: PLCへIP/Portで接続します。
     def connect(self, host:str, port:int):
         if not HAS_PYMC: raise RuntimeError("pymcprotocol 未導入")
         self.cli=pymcprotocol.Type3E(plctype="Q")
         self.cli.connect(host, port)
 
-    # 解説: 関数 `close` の処理開始
+    # 解説: カメラ/PLC接続を安全にクローズします。
     def close(self):
         try:
             if self.cli: self.cli.close()
@@ -468,29 +468,29 @@ class PLCClient:
             pass
         self.cli=None
 
-    # 解説: 関数 `read_bit` の処理開始
+    # 解説: PLCのビットデバイス1点を読み取りboolで返します。
     def read_bit(self, head:str)->bool:
         vals=self.cli.batchread_bitunits(headdevice=head, readsize=1)
         v=int(vals[0]) if isinstance(vals,(list,tuple)) else int(vals)
         return bool(v)
 
-    # 解説: 関数 `write_bit` の処理開始
+    # 解説: PLCのビットデバイス1点へ書き込みます。
     def write_bit(self, head:str, value:bool):
         self.cli.batchwrite_bitunits(headdevice=head, values=[1 if value else 0])
 
-    # 解説: 関数 `pulse_bit` の処理開始
+    # 解説: PLCビットを指定時間ONしてOFFへ戻します。
     def pulse_bit(self, head:str, ms:int=50):
         self.write_bit(head, True)
         time.sleep(max(0,ms)/1000.0)
         self.write_bit(head, False)
 
-    # 解説: 関数 `read_word` の処理開始
+    # 解説: PLCワードデバイス1点を読み取り16bit整数で返します。
     def read_word(self, head:str)->int:
         vals=self.cli.batchread_wordunits(headdevice=head, readsize=1)
         v=int(vals[0]) if isinstance(vals,(list,tuple)) else int(vals)
         return v & 0xFFFF
 
-    # 解説: 関数 `write_word` の処理開始
+    # 解説: PLCワードデバイス1点へ16bit値を書き込みます。
     def write_word(self, head:str, value:int):
         self.cli.batchwrite_wordunits(headdevice=head, values=[int(value)&0xFFFF])
 
@@ -500,7 +500,7 @@ class PLCClient:
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".notch_app_config.json")
 
 @dataclass
-# 解説: クラス `AppConfig` の定義
+# 解説: クラス `AppConfig` の定義（関連する状態と処理をまとめる単位）
 class AppConfig:
     # 解析パラメータ
     trim_ratio_x: float = 0.25
@@ -553,7 +553,7 @@ class AppConfig:
     auto_watch_on_ready: bool = True
 
     @staticmethod
-    # 解説: 関数 `load` の処理開始
+    # 解説: 設定JSONを読み込み、既知キーのみ反映してAppConfigを返します。
     def load():
         try:
             with open(CONFIG_PATH,"r",encoding="utf-8") as f:
@@ -564,7 +564,7 @@ class AppConfig:
         except Exception:
             return AppConfig()
 
-    # 解説: 関数 `save` の処理開始
+    # 解説: 現在設定をJSONファイルへ保存します。
     def save(self):
         try:
             with open(CONFIG_PATH,"w",encoding="utf-8") as f:
@@ -575,9 +575,9 @@ class AppConfig:
 
 # 解説: ここから大きな処理ブロック
 # ================== UI: ズーム・パンキャンバス ==================
-# 解説: クラス `ZoomPanCanvas` の定義
+# 解説: クラス `ZoomPanCanvas` の定義（関連する状態と処理をまとめる単位）
 class ZoomPanCanvas(tk.Canvas):
-    # 解説: 関数 `__init__` の処理開始
+    # 解説: 関数 `__init__` の処理を担当します。
     def __init__(self, master, bg="#222", **kw):
         super().__init__(master, bg=bg, highlightthickness=0, **kw)
         self._img_pil=None; self._img_tk=None; self._img_id=None
@@ -591,18 +591,18 @@ class ZoomPanCanvas(tk.Canvas):
         self.bind("<Button-4>", lambda e: self._zoom_at(1.1, e.x, e.y))
         self.bind("<Button-5>", lambda e: self._zoom_at(1/1.1, e.x, e.y))
 
-    # 解説: 関数 `set_image` の処理開始
+    # 解説: キャンバスに表示するPIL画像をセットして再描画します。
     def set_image(self, pil_image):
         self._img_pil=pil_image
         if self._img_id is None: self.fit_to_window()
         else: self._render()
 
-    # 解説: 関数 `clear` の処理開始
+    # 解説: 画像表示状態とズーム/オフセットを初期化します。
     def clear(self):
         if self._img_id is not None: self.delete(self._img_id); self._img_id=None
         self._img_pil=None; self._img_tk=None; self.zoom=1.0; self.offset=np.array([0.0,0.0])
 
-    # 解説: 関数 `fit_to_window` の処理開始
+    # 解説: 画像全体が表示枠に収まる倍率へ自動調整します。
     def fit_to_window(self):
         if self._img_pil is None: return
         cw=max(self.winfo_width(),1); ch=max(self.winfo_height(),1)
@@ -613,7 +613,7 @@ class ZoomPanCanvas(tk.Canvas):
         self.offset=np.array([(cw - iw*self.zoom)/2.0, (ch - ih*self.zoom)/2.0])
         self._render()
 
-    # 解説: 関数 `set_zoom_100` の処理開始
+    # 解説: 表示倍率を100%へ設定します。
     def set_zoom_100(self):
         if self._img_pil is None: return
         cw=max(self.winfo_width(),1); ch=max(self.winfo_height(),1)
@@ -621,27 +621,27 @@ class ZoomPanCanvas(tk.Canvas):
         self.zoom=1.0
         self.offset=np.array([(cw-iw)/2.0, (ch-ih)/2.0]); self._render()
 
-    # 解説: 関数 `zoom_in` の処理開始
+    # 解説: 中心基準で拡大します。
     def zoom_in(self):  self._zoom_at(1.2, self.winfo_width()/2.0, self.winfo_height()/2.0)
-    # 解説: 関数 `zoom_out` の処理開始
+    # 解説: 中心基準で縮小します。
     def zoom_out(self): self._zoom_at(1/1.2, self.winfo_width()/2.0, self.winfo_height()/2.0)
 
-    # 解説: 関数 `_on_configure` の処理開始
+    # 解説: ウィンドウサイズ変更時に再描画します。
     def _on_configure(self,_): self._render()
-    # 解説: 関数 `_on_press` の処理開始
+    # 解説: ドラッグ開始位置を記録します。
     def _on_press(self,e): self._drag_start=np.array([e.x,e.y])
-    # 解説: 関数 `_on_drag` の処理開始
+    # 解説: ドラッグ量に応じて画像表示オフセットを移動します。
     def _on_drag(self,e):
         if self._drag_start is None: return
         cur=np.array([e.x,e.y]); delta=cur-self._drag_start
         self._drag_start=cur; self.offset+=delta; self._render()
-    # 解説: 関数 `_on_release` の処理開始
+    # 解説: ドラッグ状態を終了します。
     def _on_release(self,_): self._drag_start=None
-    # 解説: 関数 `_on_wheel` の処理開始
+    # 解説: マウスホイール操作でズームします。
     def _on_wheel(self,e):
         if e.delta>0: self._zoom_at(1.1, e.x, e.y)
         elif e.delta<0: self._zoom_at(1/1.1, e.x, e.y)
-    # 解説: 関数 `_zoom_at` の処理開始
+    # 解説: 指定座標を基準に倍率変更し、見ている位置を維持します。
     def _zoom_at(self, factor, cx, cy):
         if self._img_pil is None: return
         old=self.zoom; new=max(self.min_zoom, min(self.max_zoom, self.zoom*factor))
@@ -649,7 +649,7 @@ class ZoomPanCanvas(tk.Canvas):
         img_pt=(np.array([cx,cy]) - self.offset)/old
         self.zoom=new; self.offset=np.array([cx,cy]) - img_pt*self.zoom
         self._render()
-    # 解説: 関数 `_render` の処理開始
+    # 解説: 現在の倍率/オフセットで画像を再描画します。
     def _render(self):
         self.delete("all")
         if self._img_pil is None: return
@@ -661,9 +661,9 @@ class ZoomPanCanvas(tk.Canvas):
 
 # 解説: ここから大きな処理ブロック
 # ================== スクロール可能フレーム（左ペイン） ==================
-# 解説: クラス `ScrollFrame` の定義
+# 解説: クラス `ScrollFrame` の定義（関連する状態と処理をまとめる単位）
 class ScrollFrame(ttk.Frame):
-    # 解説: 関数 `__init__` の処理開始
+    # 解説: 関数 `__init__` の処理を担当します。
     def __init__(self, master, **kw):
         super().__init__(master, **kw)
         canvas = tk.Canvas(self, highlightthickness=0)
@@ -676,7 +676,7 @@ class ScrollFrame(ttk.Frame):
         self.inner = ttk.Frame(canvas)
         self.inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         self._win = canvas.create_window((0,0), window=self.inner, anchor="nw")
-        # 解説: 関数 `_resize` の処理開始
+        # 解説: 内部フレーム幅をキャンバス幅へ追従させます。
         def _resize(_):
             canvas.itemconfigure(self._win, width=canvas.winfo_width())
         canvas.bind("<Configure>", _resize)
@@ -684,9 +684,9 @@ class ScrollFrame(ttk.Frame):
 
 # 解説: ここから大きな処理ブロック
 # ================== メインアプリ ==================
-# 解説: クラス `NotchApp` の定義
+# 解説: クラス `NotchApp` の定義（関連する状態と処理をまとめる単位）
 class NotchApp(ttk.Window):
-    # 解説: 関数 `__init__` の処理開始
+    # 解説: 関数 `__init__` の処理を担当します。
     def __init__(self):
         super().__init__(themename="darkly")
         self.title("ガラス基板ノッチ判定ツール")
@@ -779,7 +779,7 @@ class NotchApp(ttk.Window):
         self.after(300, self._auto_manager_start)
 
     # ---------- メニュー ----------
-    # 解説: 関数 `_build_menu` の処理開始
+    # 解説: メニューバー（設定/操作）を構築します。
     def _build_menu(self):
         menubar=tk.Menu(self)
         self.config(menu=menubar)
@@ -810,7 +810,7 @@ class NotchApp(ttk.Window):
         m_ops.add_command(label="PLCエラークリア", command=self.on_clear_errors)
 
     # ---------- メインUI ----------
-    # 解説: 関数 `_build_ui` の処理開始
+    # 解説: メイン画面の左ペイン・プレビュー・ログUIを構築します。
     def _build_ui(self):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
@@ -928,7 +928,7 @@ class NotchApp(ttk.Window):
         self.canvas.bind("<Configure>", lambda _e: self.zoom_label.config(text=f"{self.canvas.zoom*100:.0f}%"))
 
     # ---------- 設定ダイアログ ----------
-    # 解説: 関数 `_open_plc_settings` の処理開始
+    # 解説: PLC接続先/デバイス割当を編集するダイアログを開きます。
     def _open_plc_settings(self):
         win=tk.Toplevel(self); win.title("PLC連携 設定"); win.transient(self); win.grab_set()
         frm=ttk.Frame(win, padding=10); frm.pack(fill="both", expand=True)
@@ -941,7 +941,7 @@ class NotchApp(ttk.Window):
         # デバイス
         sec2=ttk.Labelframe(frm, text="デバイス割当", padding=8); sec2.pack(fill="x", pady=6)
         grid=ttk.Frame(sec2); grid.pack(fill="x")
-        # 解説: 関数 `row` の処理開始
+        # 解説: 関数 `row` の処理を担当します。
         def row(label, var):
             rr=ttk.Frame(grid); rr.pack(fill="x", pady=2)
             ttk.Label(rr, text=label, width=16).pack(side="left")
@@ -966,13 +966,13 @@ class NotchApp(ttk.Window):
         ttk.Label(frm, text="変更は即保存されます。閉じるときは右上×で閉じてください。", bootstyle=INFO).pack(anchor="w", pady=(8,0))
 
         # IP/Port 表示の同期
-        # 解説: 関数 `sync_target` の処理開始
+        # 解説: 関数 `sync_target` の処理を担当します。
         def sync_target(*_):
             self.lbl_plc_target.configure(text=f"ターゲット: {self.var_plc_ip.get()}:{self.var_plc_port.get()}")
         self.var_plc_ip.trace_add("write", sync_target)
         self.var_plc_port.trace_add("write", sync_target)
 
-    # 解説: 関数 `_open_camera_settings` の処理開始
+    # 解説: 検出したGigEカメラから接続対象を選ぶダイアログを開きます。
     def _open_camera_settings(self):
         win=tk.Toplevel(self); win.title("カメラ設定"); win.transient(self); win.grab_set()
         frm=ttk.Frame(win, padding=10); frm.pack(fill="both", expand=True)
@@ -987,14 +987,14 @@ class NotchApp(ttk.Window):
         current_label=next((label for idx, label in devices if idx==self.var_camera_index.get()), labels[0])
         cmb.set(current_label)
         cmb.pack(anchor="w", pady=(8,0))
-        # 解説: 関数 `on_select` の処理開始
+        # 解説: 関数 `on_select` の処理を担当します。
         def on_select(_event=None):
             label=cmb.get()
             self.var_camera_index.set(idx_map.get(label, 0))
         cmb.bind("<<ComboboxSelected>>", on_select)
         ttk.Label(frm, text="変更は即保存されます。", bootstyle=INFO).pack(anchor="w", pady=(8,0))
 
-    # 解説: 関数 `_open_hb_settings` の処理開始
+    # 解説: ハートビート設定ダイアログを開きます。
     def _open_hb_settings(self):
         win=tk.Toplevel(self); win.title("生存カウンタ 設定"); win.transient(self); win.grab_set()
         frm=ttk.Frame(win, padding=10); frm.pack(fill="both", expand=True)
@@ -1005,7 +1005,7 @@ class NotchApp(ttk.Window):
         ttk.Checkbutton(frm, text="PLC接続時に自動開始", variable=self.var_alive_auto).pack(anchor="w", pady=(8,2))
         ttk.Label(frm, text="変更は即保存されます。", bootstyle=INFO).pack(anchor="w")
 
-    # 解説: 関数 `_open_temp_settings` の処理開始
+    # 解説: 一時ファイル上限や清掃を設定する画面を開きます。
     def _open_temp_settings(self):
         win=tk.Toplevel(self); win.title("一時ファイル管理"); win.transient(self); win.grab_set()
         frm=ttk.Frame(win, padding=10); frm.pack(fill="both", expand=True)
@@ -1014,7 +1014,7 @@ class NotchApp(ttk.Window):
         ttk.Button(frm, text="今すぐ清掃", command=self._auto_cleanup_temp_files).pack(anchor="w", pady=(8,2))
         ttk.Label(frm, text="BaslerShot_*/PLCshot_* を古い順に削除します。", bootstyle=INFO).pack(anchor="w")
 
-    # 解説: 関数 `_open_result_settings` の処理開始
+    # 解説: 結果CSV上限やPLC画像保存先を設定します。
     def _open_result_settings(self):
         win=tk.Toplevel(self); win.title("結果CSV/保存先 設定"); win.transient(self); win.grab_set()
         frm=ttk.Frame(win, padding=10); frm.pack(fill="both", expand=True)
@@ -1027,17 +1027,17 @@ class NotchApp(ttk.Window):
         ttk.Button(r2, text="参照…", command=self._pick_plcshot_dir).pack(side="left")
         ttk.Label(frm, text="変更は即保存されます。", bootstyle=INFO).pack(anchor="w", pady=(8,0))
 
-    # 解説: 関数 `_pick_plcshot_dir` の処理開始
+    # 解説: PLC撮像画像の保存フォルダを選択します。
     def _pick_plcshot_dir(self):
         d=filedialog.askdirectory(title="PLCトリガで保存する画像の保存先フォルダを選択")
         if d:
             self.var_plc_shot_dir.set(d)
 
     # ---------- 設定トレース（即保存 + 自動プレビュー） ----------
-    # 解説: 関数 `_bind_traces` の処理開始
+    # 解説: Tk変数の変更時に設定保存・自動プレビューを連動させます。
     def _bind_traces(self):
         """Tk変数の変更を捕捉して保存。解析パラメータは自動プレビューもスケジュール"""
-        # 解説: 関数 `save_cfg` の処理開始
+        # 解説: 関数 `save_cfg` の処理を担当します。
         def save_cfg(*_):
             if self._trace_lock:
                 return
@@ -1062,17 +1062,17 @@ class NotchApp(ttk.Window):
             self.var_camera_index
         )
 
-        # 解説: 関数 `bind_with_preview` の処理開始
+        # 解説: 関数 `bind_with_preview` の処理を担当します。
         def bind_with_preview(v):
             v.trace_add("write", lambda *args: (save_cfg(), self._schedule_auto_preview()))
-        # 解説: 関数 `bind_save_only` の処理開始
+        # 解説: 関数 `bind_save_only` の処理を担当します。
         def bind_save_only(v):
             v.trace_add("write", lambda *args: save_cfg())
 
         for v in preview_vars: bind_with_preview(v)
         for v in non_preview_vars: bind_save_only(v)
 
-    # 解説: 関数 `_schedule_auto_preview` の処理開始
+    # 解説: 連続入力に対し200msデバウンスでプレビュー更新を予約します。
     def _schedule_auto_preview(self):
         """パラメータ変更時の自動プレビュー（200msデバウンス）"""
         try:
@@ -1093,7 +1093,7 @@ class NotchApp(ttk.Window):
                 pass
         self._preview_job = self.after(200, self.on_preview)
 
-    # 解説: 関数 `_sync_cfg_from_vars` の処理開始
+    # 解説: 画面のTk変数値をAppConfigへ反映します。
     def _sync_cfg_from_vars(self):
         self.cfg.trim_ratio_x=self.trim_ratio_x.get()
         self.cfg.trim_ratio_y=self.trim_ratio_y.get()
@@ -1128,14 +1128,14 @@ class NotchApp(ttk.Window):
         self.cfg.plc_shot_dir=self.var_plc_shot_dir.get().strip()
 
     # ---------- 左ペイン操作 ----------
-    # 解説: 関数 `_on_listbox_select` の処理開始
+    # 解説: ファイル選択変更時にインデックス更新と自動プレビューを行います。
     def _on_listbox_select(self,_evt=None):
         sel=self.lb_files.curselection()
         if sel:
             self.last_sel_index=sel[0]
             if self.auto_preview.get(): self.on_preview()
 
-    # 解説: 関数 `on_pick_files` の処理開始
+    # 解説: 複数画像を選択してリストへ読み込みます。
     def on_pick_files(self):
         paths=filedialog.askopenfilenames(
             title="画像を選択してください（複数選択可）",
@@ -1150,7 +1150,7 @@ class NotchApp(ttk.Window):
         if self.auto_preview.get(): self.on_preview()
         self._post_status(f"{len(self.file_paths)} 件のファイルを読み込み")
 
-    # 解説: 関数 `on_pick_outdir` の処理開始
+    # 解説: 結果の出力フォルダを選択します。
     def on_pick_outdir(self):
         d=filedialog.askdirectory(title="CSVと結果画像の出力先フォルダを選択してください")
         if d:
@@ -1158,20 +1158,20 @@ class NotchApp(ttk.Window):
             self._sync_cfg_from_vars(); self.cfg.save()
             self._post_status(f"出力先を設定: {self.output_dir}")
 
-    # 解説: 関数 `on_zoom_in` の処理開始
+    # 解説: ズームイン操作を実行します。
     def on_zoom_in(self):
         self.canvas.zoom_in(); self.zoom_label.config(text=f"{self.canvas.zoom*100:.0f}%")
-    # 解説: 関数 `on_zoom_out` の処理開始
+    # 解説: ズームアウト操作を実行します。
     def on_zoom_out(self):
         self.canvas.zoom_out(); self.zoom_label.config(text=f"{self.canvas.zoom*100:.0f}%")
-    # 解説: 関数 `on_fit` の処理開始
+    # 解説: 画像をフィット表示します。
     def on_fit(self):
         self.canvas.fit_to_window(); self.zoom_label.config(text=f"{self.canvas.zoom*100:.0f}%")
-    # 解説: 関数 `on_zoom_100` の処理開始
+    # 解説: 100%表示へ戻します。
     def on_zoom_100(self):
         self.canvas.set_zoom_100(); self.zoom_label.config(text=f"{self.canvas.zoom*100:.0f}%")
 
-    # 解説: 関数 `on_preview` の処理開始
+    # 解説: 選択画像を1枚解析してプレビュー表示します。
     def on_preview(self):
         try:
             idx=self.last_sel_index
@@ -1197,7 +1197,7 @@ class NotchApp(ttk.Window):
         except Exception as e:
             traceback.print_exc(); self._post_status(f"[エラー:プレビュー] {e}")
 
-    # 解説: 関数 `on_batch_process` の処理開始
+    # 解説: 一覧画像を順に解析し、CSVと結果画像を保存します。
     def on_batch_process(self):
         try:
             if not self.file_paths:
@@ -1241,7 +1241,7 @@ class NotchApp(ttk.Window):
         except Exception as e:
             traceback.print_exc(); self._post_status(f"[エラー:バッチ処理] {e}")
 
-    # 解説: 関数 `_show_preview` の処理開始
+    # 解説: 解析結果画像と解析情報UIを更新します。
     def _show_preview(self, path, result_dict):
         bgr=result_dict["img_bgr"]; rgb=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         self.canvas.set_image(Image.fromarray(rgb))
@@ -1260,7 +1260,7 @@ class NotchApp(ttk.Window):
               f"Bottom線:{bottom_p1}->{bottom_p2} | "
               f"flip={int(bool(self.flip_horizontal.get()))}")
         self._result_lines.appendleft(line)
-        # 解説: 関数 `_update_result` の処理開始
+        # 解説: 関数 `_update_result` の処理を担当します。
         def _update_result():
             self.txt_result.configure(state="normal")
             self.txt_result.delete("1.0", "end")
@@ -1274,7 +1274,7 @@ class NotchApp(ttk.Window):
         self.last_result=result_dict; self.last_result_path=path
 
     # ---------- カメラ共通ヘルパ（スレッド安全） ----------
-    # 解説: 関数 `_cam_open_if_needed` の処理開始
+    # 解説: 必要時のみ選択カメラへ接続し、利用可能状態を返します。
     def _cam_open_if_needed(self):
         with self._cam_lock:
             if self.basler is None:
@@ -1285,7 +1285,7 @@ class NotchApp(ttk.Window):
                     self.basler.reopen()
             return self.basler
 
-    # 解説: 関数 `_cam_close_and_null` の処理開始
+    # 解説: カメラ接続を閉じて参照をリセットします。
     def _cam_close_and_null(self):
         with self._cam_lock:
             try:
@@ -1295,7 +1295,7 @@ class NotchApp(ttk.Window):
                 pass
             self.basler = None
 
-    # 解説: 関数 `_cam_snap_bgr` の処理開始
+    # 解説: 撮像を実行し、失敗時は再接続リトライします。
     def _cam_snap_bgr(self):
         # 1回目
         with self._cam_lock:
@@ -1314,7 +1314,7 @@ class NotchApp(ttk.Window):
             return cam.snap_bgr()
 
     # ---------- 単発撮像/連続Grab ----------
-    # 解説: 関数 `on_capture_basler` の処理開始
+    # 解説: 手動単発撮像を行い、画像リストへ追加します。
     def on_capture_basler(self):
         if self.video_running:
             self._post_status("連続Grab停止中のみ単発撮像が可能です。先に［連続Grab停止］してください。")
@@ -1338,7 +1338,7 @@ class NotchApp(ttk.Window):
         except Exception as e:
             traceback.print_exc(); self._post_status(f"[エラー:撮像] {e}")
 
-    # 解説: 関数 `on_video_start` の処理開始
+    # 解説: 連続Grabスレッドを開始します。
     def on_video_start(self):
         if self.video_running:
             self._post_status("すでに連続Grab中です")
@@ -1351,7 +1351,7 @@ class NotchApp(ttk.Window):
         self.video_thread.start()
         self._post_status("連続Grab開始")
 
-    # 解説: 関数 `on_video_stop` の処理開始
+    # 解説: 連続Grabスレッドを停止します。
     def on_video_stop(self):
         if not self.video_running:
             self._post_status("連続Grabは動作していません")
@@ -1363,7 +1363,7 @@ class NotchApp(ttk.Window):
         self.video_running=False
         self._post_status("連続Grab停止")
 
-    # 解説: 関数 `_video_loop` の処理開始
+    # 解説: 連続撮像してプレビューへ反映するループ処理です。
     def _video_loop(self):
         target_fps = 15.0
         period = 1.0 / target_fps
@@ -1385,7 +1385,7 @@ class NotchApp(ttk.Window):
                 time.sleep(max(0.0, period - dt))
 
     # ---------- PLC 接続/監視 ----------
-    # 解説: 関数 `on_plc_connect` の処理開始
+    # 解説: PLCへ接続し必要ならHBを開始します。
     def on_plc_connect(self):
         try:
             # self.plc が None の場合は再生成してから接続
@@ -1401,7 +1401,7 @@ class NotchApp(ttk.Window):
             self.plc_connected=False
             self._post_status(f"[PLC接続エラー] {e}")
 
-    # 解説: 関数 `on_plc_disconnect` の処理開始
+    # 解説: PLC監視/HBを停止して切断します。
     def on_plc_disconnect(self):
         try:
             self.manual_disconnected=True
@@ -1413,20 +1413,20 @@ class NotchApp(ttk.Window):
             self.plc_connected=False
             self._post_status("PLC切断しました")
 
-    # 解説: 関数 `on_test_done` の処理開始
+    # 解説: DONEビットのテストパルスを送信します。
     def on_test_done(self):
         self._safe_plc(lambda: self.plc.pulse_bit(self.var_dev_done.get().strip(), self.var_done_ms.get()))
 
-    # 解説: 関数 `on_clear_errors` の処理開始
+    # 解説: PLCのエラービットをクリアします。
     def on_clear_errors(self):
-        # 解説: 関数 `_clear` の処理開始
+        # 解説: 関数 `_clear` の処理を担当します。
         def _clear():
             self.plc.write_bit(self.var_dev_err_to.get().strip(), False)
             self.plc.write_bit(self.var_dev_err_an.get().strip(), False)
         self._safe_plc(_clear, quiet=True)
         self._post_status("PLCエラークリア書込み")
 
-    # 解説: 関数 `on_plc_watch_start` の処理開始
+    # 解説: PLCトリガ監視スレッドを開始します。
     def on_plc_watch_start(self):
         if not self.plc_connected:
             self._post_status("PLC 未接続です。先に接続してください。"); return
@@ -1443,7 +1443,7 @@ class NotchApp(ttk.Window):
         self.plc_thread=threading.Thread(target=self._plc_loop, daemon=True); self.plc_thread.start()
         self._post_status("トリガ監視開始")
 
-    # 解説: 関数 `on_plc_watch_stop` の処理開始
+    # 解説: PLCトリガ監視スレッドを停止します。
     def on_plc_watch_stop(self, manual:bool=True):
         self.manual_stopped = bool(manual)
         self.plc_stop=True
@@ -1452,7 +1452,7 @@ class NotchApp(ttk.Window):
         self.plc_thread=None
         self._post_status("トリガ監視停止")
 
-    # 解説: 関数 `_plc_loop` の処理開始
+    # 解説: PLCトリガ検出→撮像→解析→結果返答を繰り返します。
     def _plc_loop(self):
         poll=0.01
         while not self.plc_stop:
@@ -1576,7 +1576,7 @@ class NotchApp(ttk.Window):
             time.sleep(poll)
 
     # ---------- ハートビート ----------
-    # 解説: 関数 `_hb_start_if_needed` の処理開始
+    # 解説: 条件が揃っていればHB書込スレッドを開始します。
     def _hb_start_if_needed(self):
         if not self.plc_connected: return
         if not self.var_alive_auto.get(): return
@@ -1589,7 +1589,7 @@ class NotchApp(ttk.Window):
         self.hb_thread=threading.Thread(target=self._hb_loop, daemon=True); self.hb_thread.start()
         self._post_status("HB自動開始")
 
-    # 解説: 関数 `_hb_stop` の処理開始
+    # 解説: HB書込スレッドを停止します。
     def _hb_stop(self):
         self.hb_stop=True
         if self.hb_thread and self.hb_thread.is_alive():
@@ -1597,7 +1597,7 @@ class NotchApp(ttk.Window):
         self.hb_thread=None
         self._post_status("HB停止")
 
-    # 解説: 関数 `_hb_loop` の処理開始
+    # 解説: 一定周期で生存カウンタをPLCへ書き込みます。
     def _hb_loop(self):
         last_err=0.0
         while not self.hb_stop:
@@ -1616,11 +1616,11 @@ class NotchApp(ttk.Window):
             time.sleep(max(10, int(self.var_alive_ms.get()))/1000.0)
 
     # ---------- 自動再接続マネージャ ----------
-    # 解説: 関数 `_auto_manager_start` の処理開始
+    # 解説: 自動再接続マネージャスレッドを起動します。
     def _auto_manager_start(self):
         threading.Thread(target=self._auto_manager_loop, daemon=True).start()
 
-    # 解説: 関数 `_auto_manager_loop` の処理開始
+    # 解説: PLC/カメラの再接続監視と自動監視開始を行います。
     def _auto_manager_loop(self):
         plc_backoff=1.0; cam_backoff=1.0
         while True:
@@ -1688,11 +1688,11 @@ class NotchApp(ttk.Window):
                 time.sleep(1.0)
 
     # ---------- ステータス/スレッド安全UI ----------
-    # 解説: 関数 `_post_status` の処理開始
+    # 解説: ステータス欄へ最新5件をスレッド安全に反映します。
     def _post_status(self, text):
         stamp=f"{time.strftime('%H:%M:%S')} | {text}"
         self._log_lines.appendleft(stamp)
-        # 解説: 関数 `_update` の処理開始
+        # 解説: 関数 `_update` の処理を担当します。
         def _update():
             self.txt_log.configure(state="normal")
             self.txt_log.delete("1.0", "end")
@@ -1703,14 +1703,14 @@ class NotchApp(ttk.Window):
         except Exception:
             pass
 
-    # 解説: 関数 `_post_preview` の処理開始
+    # 解説: スレッドからUIへプレビュー更新要求を投げます。
     def _post_preview(self, path, resdict):
         try:
             self.after(0, lambda: self._show_preview(path, resdict))
         except Exception:
             pass
 
-    # 解説: 関数 `_post_list_add` の処理開始
+    # 解説: スレッドからUIリストへファイル追加要求を投げます。
     def _post_list_add(self, path):
         try:
             self.after(0, lambda: (self.lb_files.insert(tk.END, path),
@@ -1719,7 +1719,7 @@ class NotchApp(ttk.Window):
         except Exception:
             pass
 
-    # 解説: 関数 `_safe_plc` の処理開始
+    # 解説: PLC処理を例外保護付きで実行し、必要なら通知します。
     def _safe_plc(self, func, quiet=False):
         try:
             func()
@@ -1728,13 +1728,13 @@ class NotchApp(ttk.Window):
             if not quiet: self._post_status(f"[PLCエラー] {e}")
 
     # ---------- 結果CSVユーティリティ（最大レコード数ローテーション） ----------
-    # 解説: 関数 `_get_result_csv_path` の処理開始
+    # 解説: 結果CSVの保存先パスを決定して返します。
     def _get_result_csv_path(self):
         base = self.output_dir if self.output_dir else (self.cfg.plc_shot_dir or tempfile.gettempdir())
         os.makedirs(base, exist_ok=True)
         return os.path.join(base, "result.csv")
 
-    # 解説: 関数 `_append_result_csv` の処理開始
+    # 解説: CSVを最大レコード数でローテーション更新します。
     def _append_result_csv(self, csv_path, header, row):
         max_records = max(1, int(self.csv_max_records.get()))
         rows=[]
@@ -1761,7 +1761,7 @@ class NotchApp(ttk.Window):
             w.writerows(rows)
 
     # ---------- 一時ファイル清掃 ----------
-    # 解説: 関数 `_auto_cleanup_temp_files` の処理開始
+    # 解説: 一時画像を上限枚数になるよう古い順に削除します。
     def _auto_cleanup_temp_files(self):
         try:
             max_files=int(self.temp_max_files.get())
@@ -1781,7 +1781,7 @@ class NotchApp(ttk.Window):
             self._post_status(f"[Temp清掃エラー] {e}")
 
     # ---------- 終了 ----------
-    # 解説: 関数 `destroy` の処理開始
+    # 解説: 終了時に監視停止/切断/設定保存を行ってウィンドウを閉じます。
     def destroy(self):
         try:
             self.on_plc_watch_stop(manual=True)
