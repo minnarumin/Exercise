@@ -22,7 +22,8 @@ from tkinter import filedialog
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from PIL import Image, ImageTk
-import csv, os, re, traceback, tempfile, time, json, glob, threading
+import csv, os, re, traceback, tempfile, time, json, glob, threading, sys, logging, faulthandler, signal, atexit
+from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, asdict, field, fields
 from collections import deque
 
@@ -38,6 +39,69 @@ try:
     HAS_PYMC = True
 except Exception:
     HAS_PYMC = False
+
+
+# ================== ログ/障害調査支援 ==================
+LOG_PATH = os.path.join(os.path.expanduser("~"), "notch_app.log")
+FAULT_LOG_PATH = os.path.join(os.path.expanduser("~"), "notch_app_fault.log")
+
+def _setup_logging():
+    logger = logging.getLogger("notch_app")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    h = RotatingFileHandler(LOG_PATH, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s %(message)s"))
+    logger.addHandler(h)
+    logger.propagate = False
+    logger.info("===== notch_app start =====")
+    return logger
+
+LOGGER = _setup_logging()
+
+def _setup_global_exception_logging():
+    def _sys_hook(exc_type, exc_value, exc_tb):
+        LOGGER.exception("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+    sys.excepthook = _sys_hook
+    if hasattr(threading, "excepthook"):
+        def _thread_hook(args):
+            LOGGER.exception("Unhandled thread exception", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+        threading.excepthook = _thread_hook
+
+def _setup_fault_handler():
+    try:
+        f = open(FAULT_LOG_PATH, "a", encoding="utf-8")
+        faulthandler.enable(file=f, all_threads=True)
+        # UIフリーズ疑い時にスタックを定期ダンプできるようにする（調査用途）
+        faulthandler.dump_traceback_later(60, repeat=True, file=f)
+        LOGGER.info("Fault handler enabled: %s", FAULT_LOG_PATH)
+        return f
+    except Exception:
+        LOGGER.exception("Failed to enable fault handler")
+        return None
+
+_setup_global_exception_logging()
+_FAULT_HANDLER_FILE = _setup_fault_handler()
+
+def _log_signal(sig, _frame):
+    try:
+        LOGGER.error("Received termination signal: %s", sig)
+    except Exception:
+        pass
+
+def _on_process_exit():
+    try:
+        LOGGER.info("===== notch_app exit =====")
+    except Exception:
+        pass
+
+try:
+    signal.signal(signal.SIGTERM, _log_signal)
+    signal.signal(signal.SIGINT, _log_signal)
+except Exception:
+    LOGGER.exception("Failed to register signal handlers")
+
+atexit.register(_on_process_exit)
 
 
 # ================== 低レベルユーティリティ ==================
@@ -1095,7 +1159,8 @@ class NotchApp(ttk.Window):
             )
             self._show_preview(path, res)
         except Exception as e:
-            traceback.print_exc(); self._post_status(f"[エラー:プレビュー] {e}")
+            LOGGER.exception("Preview failed")
+            self._post_status(f"[エラー:プレビュー] {e}")
 
     def on_batch_process(self):
         try:
@@ -1135,10 +1200,12 @@ class NotchApp(ttk.Window):
                     self._append_result_csv(csv_path, header, row)
                     count_ok+=1
                 except Exception as ie:
-                    traceback.print_exc(); self._post_status(f"[警告] 失敗: {path} : {ie}")
+                    LOGGER.exception("Batch item failed: %s", path)
+                    self._post_status(f"[警告] 失敗: {path} : {ie}")
             self._post_status(f"バッチ完了: {count_ok}件 / CSV: {csv_path}")
         except Exception as e:
-            traceback.print_exc(); self._post_status(f"[エラー:バッチ処理] {e}")
+            LOGGER.exception("Batch processing failed")
+            self._post_status(f"[エラー:バッチ処理] {e}")
 
     def _show_preview(self, path, result_dict):
         bgr=result_dict["img_bgr"]; rgb=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -1229,7 +1296,8 @@ class NotchApp(ttk.Window):
             if self.auto_preview.get(): self.on_preview()
             self._post_status(f"撮像: {tmp_path}")
         except Exception as e:
-            traceback.print_exc(); self._post_status(f"[エラー:撮像] {e}")
+            LOGGER.exception("Single capture failed")
+            self._post_status(f"[エラー:撮像] {e}")
 
     def on_video_start(self):
         if self.video_running:
@@ -1568,6 +1636,15 @@ class NotchApp(ttk.Window):
     def _post_status(self, text):
         stamp=f"{time.strftime('%H:%M:%S')} | {text}"
         self._log_lines.appendleft(stamp)
+        try:
+            if "[エラー" in text or "失敗" in text or "通信断" in text or "Exception" in text:
+                LOGGER.error(text)
+            elif "警告" in text:
+                LOGGER.warning(text)
+            else:
+                LOGGER.info(text)
+        except Exception:
+            pass
         def _update():
             self.txt_log.configure(state="normal")
             self.txt_log.delete("1.0", "end")
@@ -1661,8 +1738,20 @@ class NotchApp(ttk.Window):
                 try: self.basler.close()
                 except: pass
             self._sync_cfg_from_vars(); self.cfg.save()
+            try:
+                faulthandler.cancel_dump_traceback_later()
+            except Exception:
+                pass
+            try:
+                global _FAULT_HANDLER_FILE
+                if _FAULT_HANDLER_FILE:
+                    _FAULT_HANDLER_FILE.flush()
+                    _FAULT_HANDLER_FILE.close()
+                    _FAULT_HANDLER_FILE = None
+            except Exception:
+                LOGGER.exception("Failed to close fault handler file")
         except Exception:
-            pass
+            LOGGER.exception("Error while destroying app")
         super().destroy()
 
 
