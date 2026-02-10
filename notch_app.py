@@ -314,6 +314,10 @@ def analyze_image(
         P=np.mean(quad_down, axis=0).astype(int)
         cv2.putText(vis_mask, f"RD: {rd_result} ({rd_area})",(P[0]+5,P[1]+5),cv2.FONT_HERSHEY_SIMPLEX,1.1,(255,0,0),3)
 
+    if flip_horizontal:
+        cv2.putText(vis_mask, "FLIP: ON", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 3, cv2.LINE_AA)
+        cv2.putText(vis_mask, "FLIP: ON", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (30,30,30), 1, cv2.LINE_AA)
+
     side_label = "Side"
     return {
         "img_bgr": vis_mask,
@@ -686,6 +690,8 @@ class NotchApp(ttk.Window):
 
         # ログ（最新5行）
         self._log_lines=deque(maxlen=5)
+        # 解析結果（最新5行）
+        self._result_lines=deque(maxlen=5)
 
         # UI
         self._build_menu()
@@ -1141,24 +1147,21 @@ class NotchApp(ttk.Window):
         top_p1, top_p2 = result_dict["top_line"]
         side_p1, side_p2 = result_dict["side_line"]
         bottom_p1, bottom_p2 = result_dict["bottom_line"]
-        result_lines=[
-            f"ファイル: {os.path.basename(path)}",
-            f"RU: {result_dict['ru_result']} ({result_dict['ru_area']})",
-            f"RD: {result_dict['rd_result']} ({result_dict['rd_area']})",
-            f"Top傾き: {result_dict['top_angle_deg']:.3f}°",
-            f"{result_dict['side_label']}傾き: {result_dict['side_angle_deg']:.3f}°",
-            f"Bottom傾き: {result_dict['bottom_angle_deg']:.3f}°",
-            f"Top線: {top_p1}->{top_p2}",
-            f"{result_dict['side_label']}線: {side_p1}->{side_p2}",
-            f"Bottom線: {bottom_p1}->{bottom_p2}",
-            f"trim=({self.trim_ratio_x.get():.2f},{self.trim_ratio_y.get():.2f}) th={self.diff_thresh.get()}",
-            f"bands=({self.band_top.get()},{self.band_right.get()},{self.band_bottom.get()}) "
-            f"exclude=({self.corner_exclude_x_px.get()},{self.corner_exclude_y_px.get()})"
-        ]
+        line=(f"{time.strftime('%H:%M:%S')} | {os.path.basename(path)} | "
+              f"RU={result_dict['ru_result']}({result_dict['ru_area']}) "
+              f"RD={result_dict['rd_result']}({result_dict['rd_area']}) | "
+              f"Top={result_dict['top_angle_deg']:.3f}° "
+              f"{result_dict['side_label']}={result_dict['side_angle_deg']:.3f}° "
+              f"Bottom={result_dict['bottom_angle_deg']:.3f}° | "
+              f"Top線:{top_p1}->{top_p2} "
+              f"{result_dict['side_label']}線:{side_p1}->{side_p2} "
+              f"Bottom線:{bottom_p1}->{bottom_p2} | "
+              f"flip={int(bool(self.flip_horizontal.get()))}")
+        self._result_lines.appendleft(line)
         def _update_result():
             self.txt_result.configure(state="normal")
             self.txt_result.delete("1.0", "end")
-            self.txt_result.insert("1.0", "\n".join(result_lines))
+            self.txt_result.insert("1.0", "\n".join(list(self._result_lines)))
             self.txt_result.configure(state="disabled")
         try:
             self.after(0, _update_result)
