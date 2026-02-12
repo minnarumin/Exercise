@@ -750,6 +750,11 @@ class NotchApp(ttk.Window):
         self.plc_thread=None; self.plc_stop=False; self.prev_trig=False
         self.plc_worker_thread=None
         self._plc_lock = threading.RLock()
+        self._csv_lock = threading.RLock()
+        self._file_paths_lock = threading.RLock()
+        self._log_lock = threading.RLock()
+        self._name_lock = threading.RLock()
+        self._shot_seq = 0
         self.trigger_queue = queue.Queue(maxsize=64)
         self.trigger_seq = 0
         self.var_use_sw_trig=tk.BooleanVar(value=self.cfg.use_sw_trig)
@@ -1091,7 +1096,7 @@ class NotchApp(ttk.Window):
                 return
         except Exception:
             return
-        if not self.file_paths:
+        if not self._get_file_paths_snapshot():
             return
         if self.last_sel_index is None and not self.lb_files.curselection():
             return
@@ -1137,6 +1142,24 @@ class NotchApp(ttk.Window):
         self.cfg.csv_max_records=int(self.csv_max_records.get())
         self.cfg.plc_shot_dir=self.var_plc_shot_dir.get().strip()
 
+    def _next_shot_path(self, base_dir, prefix, ext=".png"):
+        os.makedirs(base_dir, exist_ok=True)
+        with self._name_lock:
+            self._shot_seq += 1
+            seq = self._shot_seq
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        name = f"{prefix}{ts}_{seq:06d}{ext}"
+        return os.path.join(base_dir, name)
+
+    def _append_file_path(self, path):
+        with self._file_paths_lock:
+            self.file_paths.append(path)
+            return len(self.file_paths) - 1
+
+    def _get_file_paths_snapshot(self):
+        with self._file_paths_lock:
+            return list(self.file_paths)
+
     # ---------- 左ペイン操作 ----------
     def _on_listbox_select(self,_evt=None):
         sel=self.lb_files.curselection()
@@ -1150,13 +1173,15 @@ class NotchApp(ttk.Window):
             filetypes=[("画像ファイル","*.bmp;*.jpg;*.jpeg;*.png"),("すべてのファイル","*.*")]
         )
         if not paths: return
-        self.file_paths=list(paths)
+        paths_list=list(paths)
+        with self._file_paths_lock:
+            self.file_paths=paths_list
         self.lb_files.delete(0, tk.END)
-        for p in self.file_paths: self.lb_files.insert(tk.END, p)
+        for p in paths_list: self.lb_files.insert(tk.END, p)
         self.lb_files.selection_set(0); self.lb_files.activate(0)
         self.last_sel_index=0
         if self.auto_preview.get(): self.on_preview()
-        self._post_status(f"{len(self.file_paths)} 件のファイルを読み込み")
+        self._post_status(f"{len(paths_list)} 件のファイルを読み込み")
 
     def on_pick_outdir(self):
         d=filedialog.askdirectory(title="CSVと結果画像の出力先フォルダを選択してください")
@@ -1181,8 +1206,9 @@ class NotchApp(ttk.Window):
                 sel=self.lb_files.curselection()
                 if not sel: self._post_status("プレビュー対象が選択されていません"); return
                 idx=sel[0]; self.last_sel_index=idx
-            if not (0<=idx<len(self.file_paths)): self._post_status("有効な画像が選択されていません"); return
-            path=self.file_paths[idx]
+            paths_snapshot=self._get_file_paths_snapshot()
+            if not (0<=idx<len(paths_snapshot)): self._post_status("有効な画像が選択されていません"); return
+            path=paths_snapshot[idx]
             res=analyze_image(
                 path,
                 trim_ratio_x=self.trim_ratio_x.get(),
@@ -1202,7 +1228,8 @@ class NotchApp(ttk.Window):
 
     def on_batch_process(self):
         try:
-            if not self.file_paths:
+            paths_snapshot=self._get_file_paths_snapshot()
+            if not paths_snapshot:
                 self._post_status("処理する画像が選択されていません"); return
             csv_path=self._get_result_csv_path()
             header=["filename","folderpath","trim_ratio_x","trim_ratio_y","diff_thresh","flip_horizontal",
@@ -1211,7 +1238,7 @@ class NotchApp(ttk.Window):
                     "top_slope","side_slope","bottom_slope",
                     "ru_area","ru_result","rd_area","rd_result","result_img"]
             count_ok=0
-            for path in self.file_paths:
+            for path in paths_snapshot:
                 try:
                     res=analyze_image(
                         path,
@@ -1335,15 +1362,13 @@ class NotchApp(ttk.Window):
             if not HAS_PYLYON:
                 self._post_status("pypylon が見つかりません。Basler Pylon と pypylon を導入してください。"); return
             img_bgr=self._cam_snap_bgr()
-            ts=time.strftime("%Y%m%d_%H%M%S")
-            tmp_path=os.path.join(tempfile.gettempdir(), f"BaslerShot_{ts}.png")
+            tmp_path=self._next_shot_path(tempfile.gettempdir(), "BaslerShot_")
             ok, buf=cv2.imencode(".png", img_bgr)
             if not ok: raise RuntimeError("撮像画像のエンコードに失敗")
             buf.tofile(tmp_path)
             self._auto_cleanup_temp_files()
-            self.file_paths.append(tmp_path)
+            self.last_sel_index=self._append_file_path(tmp_path)
             self.lb_files.insert(tk.END, tmp_path)
-            self.last_sel_index=len(self.file_paths)-1
             self.lb_files.selection_clear(0, tk.END); self.lb_files.selection_set(tk.END); self.lb_files.activate(tk.END)
             if self.auto_preview.get(): self.on_preview()
             self._post_status(f"撮像: {tmp_path}")
@@ -1540,8 +1565,7 @@ class NotchApp(ttk.Window):
         try:
             shot_dir = self.cfg.plc_shot_dir if self.cfg.plc_shot_dir else tempfile.gettempdir()
             os.makedirs(shot_dir, exist_ok=True)
-            ts=time.strftime("%Y%m%d_%H%M%S")
-            img_tmp_path=os.path.join(shot_dir, f"PLCshot_{ts}.png")
+            img_tmp_path=self._next_shot_path(shot_dir, "PLCshot_")
 
             t_cap = time.monotonic()
             img_bgr = self._cam_snap_bgr()
@@ -1588,7 +1612,7 @@ class NotchApp(ttk.Window):
                 analyze_ms = (time.monotonic() - t_an) * 1000.0
                 ru_notch=(res["ru_result"]=="NOTCH"); rd_notch=(res["rd_result"]=="NOTCH")
                 self._post_preview(img_tmp_path, res)
-                self.file_paths.append(img_tmp_path); self._post_list_add(img_tmp_path)
+                self._append_file_path(img_tmp_path); self._post_list_add(img_tmp_path)
 
                 t_csv = time.monotonic()
                 result_img_path = save_result_image(res["img_bgr"], img_tmp_path, self.output_dir or os.path.dirname(img_tmp_path))
@@ -1770,7 +1794,8 @@ class NotchApp(ttk.Window):
     # ---------- ステータス/スレッド安全UI ----------
     def _post_status(self, text):
         stamp=f"{time.strftime('%H:%M:%S')} | {text}"
-        self._log_lines.appendleft(stamp)
+        with self._log_lock:
+            self._log_lines.appendleft(stamp)
         try:
             if "[エラー" in text or "失敗" in text or "通信断" in text or "Exception" in text:
                 LOGGER.error(text)
@@ -1783,7 +1808,9 @@ class NotchApp(ttk.Window):
         def _update():
             self.txt_log.configure(state="normal")
             self.txt_log.delete("1.0", "end")
-            self.txt_log.insert("1.0", "\n".join(list(self._log_lines)))
+            with self._log_lock:
+                lines_snapshot=list(self._log_lines)
+            self.txt_log.insert("1.0", "\n".join(lines_snapshot))
             self.txt_log.configure(state="disabled")
         try:
             self.after(0, _update)
@@ -1819,29 +1846,30 @@ class NotchApp(ttk.Window):
         return os.path.join(base, "result.csv")
 
     def _append_result_csv(self, csv_path, header, row):
-        max_records = max(1, int(self.csv_max_records.get()))
-        rows=[]
-        if os.path.isfile(csv_path):
-            try:
-                with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-                    r=csv.reader(f)
-                    existing=list(r)
-                if existing:
-                    if existing[0]==header:
-                        rows=existing[1:]
-                    else:
-                        rows=existing
-            except Exception:
-                rows=[]
-        rows.append([*row])
-        if len(rows)>max_records:
-            rows = rows[-max_records:]
-        d=os.path.dirname(csv_path)
-        if d: os.makedirs(d, exist_ok=True)
-        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
-            w=csv.writer(f)
-            w.writerow(header)
-            w.writerows(rows)
+        with self._csv_lock:
+            max_records = max(1, int(self.csv_max_records.get()))
+            rows=[]
+            if os.path.isfile(csv_path):
+                try:
+                    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+                        r=csv.reader(f)
+                        existing=list(r)
+                    if existing:
+                        if existing[0]==header:
+                            rows=existing[1:]
+                        else:
+                            rows=existing
+                except Exception:
+                    rows=[]
+            rows.append([*row])
+            if len(rows)>max_records:
+                rows = rows[-max_records:]
+            d=os.path.dirname(csv_path)
+            if d: os.makedirs(d, exist_ok=True)
+            with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+                w=csv.writer(f)
+                w.writerow(header)
+                w.writerows(rows)
 
     # ---------- 一時ファイル清掃 ----------
     def _auto_cleanup_temp_files(self):
