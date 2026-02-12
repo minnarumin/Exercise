@@ -22,7 +22,7 @@ from tkinter import filedialog
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from PIL import Image, ImageTk
-import csv, os, re, traceback, tempfile, time, json, glob, threading, sys, logging, faulthandler, signal, atexit
+import csv, os, re, traceback, tempfile, time, json, glob, threading, sys, logging, faulthandler, signal, atexit, queue
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, asdict, field, fields
 from collections import deque
@@ -748,6 +748,10 @@ class NotchApp(ttk.Window):
         self.plc=PLCClient()
         self.plc_connected=False
         self.plc_thread=None; self.plc_stop=False; self.prev_trig=False
+        self.plc_worker_thread=None
+        self._plc_lock = threading.RLock()
+        self.trigger_queue = queue.Queue(maxsize=64)
+        self.trigger_seq = 0
         self.var_use_sw_trig=tk.BooleanVar(value=self.cfg.use_sw_trig)
         self.var_timeout_ms=tk.IntVar(value=self.cfg.timeout_ms)
         self.var_done_ms=tk.IntVar(value=self.cfg.done_ms)
@@ -1396,7 +1400,8 @@ class NotchApp(ttk.Window):
             # self.plc が None の場合は再生成してから接続
             if self.plc is None:
                 self.plc = PLCClient()
-            self.plc.connect(self.var_plc_ip.get().strip(), int(self.var_plc_port.get()))
+            with self._plc_lock:
+                self.plc.connect(self.var_plc_ip.get().strip(), int(self.var_plc_port.get()))
             self.plc_connected=True
             self.manual_disconnected=False
             self._post_status("PLC接続OK")
@@ -1411,8 +1416,9 @@ class NotchApp(ttk.Window):
             self.manual_disconnected=True
             self.on_plc_watch_stop(manual=True)
             self._hb_stop()
-            if self.plc:
-                self.plc.close()
+            with self._plc_lock:
+                if self.plc:
+                    self.plc.close()
         finally:
             self.plc_connected=False
             self._post_status("PLC切断しました")
@@ -1427,6 +1433,17 @@ class NotchApp(ttk.Window):
         self._safe_plc(_clear, quiet=True)
         self._post_status("PLCエラークリア書込み")
 
+    def _queue_trigger(self, trig_ts):
+        self.trigger_seq += 1
+        item = {"id": self.trigger_seq, "detected_ts": float(trig_ts)}
+        try:
+            self.trigger_queue.put_nowait(item)
+            qsize = self.trigger_queue.qsize()
+            LOGGER.info("Trigger queued id=%s queue=%s", item["id"], qsize)
+        except queue.Full:
+            self._post_status("[警告] トリガキュー満杯のため最新トリガを破棄しました")
+            LOGGER.warning("Trigger dropped because queue is full")
+
     def on_plc_watch_start(self):
         if not self.plc_connected:
             self._post_status("PLC 未接続です。先に接続してください。"); return
@@ -1438,9 +1455,20 @@ class NotchApp(ttk.Window):
             self._post_status(f"カメラ初期化に失敗: {e}"); return
         if self.plc_thread and self.plc_thread.is_alive():
             self._post_status("既に監視中です"); return
+
+        # 監視開始時にキューをクリア
+        while True:
+            try:
+                self.trigger_queue.get_nowait()
+            except queue.Empty:
+                break
+
         self.plc_stop=False; self.prev_trig=False
         self.manual_stopped=False
-        self.plc_thread=threading.Thread(target=self._plc_loop, daemon=True); self.plc_thread.start()
+        self.plc_thread=threading.Thread(target=self._plc_loop, daemon=True, name="PLCTriggerPoll")
+        self.plc_worker_thread=threading.Thread(target=self._plc_worker_loop, daemon=True, name="PLCTriggerWorker")
+        self.plc_thread.start()
+        self.plc_worker_thread.start()
         self._post_status("トリガ監視開始")
 
     def on_plc_watch_stop(self, manual:bool=True):
@@ -1448,7 +1476,10 @@ class NotchApp(ttk.Window):
         self.plc_stop=True
         if self.plc_thread and self.plc_thread.is_alive():
             self.plc_thread.join(timeout=1.0)
+        if self.plc_worker_thread and self.plc_worker_thread.is_alive():
+            self.plc_worker_thread.join(timeout=1.0)
         self.plc_thread=None
+        self.plc_worker_thread=None
         self._post_status("トリガ監視停止")
 
     def _plc_loop(self):
@@ -1456,7 +1487,8 @@ class NotchApp(ttk.Window):
         read_err_count=0
         while not self.plc_stop:
             try:
-                trig=self.plc.read_bit(self.var_dev_trig.get().strip())
+                with self._plc_lock:
+                    trig=self.plc.read_bit(self.var_dev_trig.get().strip())
                 read_err_count=0
             except Exception as e:
                 read_err_count += 1
@@ -1464,127 +1496,166 @@ class NotchApp(ttk.Window):
                 if read_err_count >= int(self.plc_read_error_threshold):
                     self._post_status("PLC読取エラー多発のため監視を再起動します")
                     try:
-                        if self.plc:
-                            self.plc.close()
+                        with self._plc_lock:
+                            if self.plc:
+                                self.plc.close()
                     except Exception:
                         LOGGER.exception("Failed to close PLC on repeated read errors")
                     self.plc_connected=False
+                    self.plc_stop=True
                     break
                 time.sleep(0.2); continue
 
             if trig and not self.prev_trig:
-                self._post_status("トリガ検出: 撮像→解析→返答")
-                self._safe_plc(lambda: self.plc.write_bit(self.var_dev_busy.get().strip(), True), quiet=True)
-                self._safe_plc(lambda: self.plc.write_bit(self.var_dev_err_to.get().strip(), False), quiet=True)
-                self._safe_plc(lambda: self.plc.write_bit(self.var_dev_err_an.get().strip(), False), quiet=True)
-
-                ok_capture=True; img_tmp_path=None
-                error_type=None
-                try:
-                    shot_dir = self.cfg.plc_shot_dir if self.cfg.plc_shot_dir else tempfile.gettempdir()
-                    os.makedirs(shot_dir, exist_ok=True)
-                    ts=time.strftime("%Y%m%d_%H%M%S")
-                    img_tmp_path=os.path.join(shot_dir, f"PLCshot_{ts}.png")
-
-                    img_bgr = self._cam_snap_bgr()
-
-                    ok, buf=cv2.imencode(".png", img_bgr)
-                    if ok:
-                        buf.tofile(img_tmp_path)
-                        self._auto_cleanup_temp_files()
-                    else:
-                        ok_capture=False
-                        error_type="CAPTURE"
-                except Exception as e:
-                    ok_capture=False
-                    msg=str(e).lower()
-                    error_type = "TIMEOUT" if ("timeout" in msg or "time out" in msg) else "CAPTURE"
-                    self._post_status(f"撮像エラー: {e}")
-                    self._cam_close_and_null()
-
-                ru_notch=False; rd_notch=False; to_error=False; an_error=False
-                csv_path=self._get_result_csv_path()
-                header=["filename","folderpath","trim_ratio_x","trim_ratio_y","diff_thresh","flip_horizontal",
-                        "band_top","band_right","band_bottom","corner_exclude_x_px","corner_exclude_y_px",
-                        "top_angle_deg","side_angle_deg","bottom_angle_deg",
-                        "top_slope","side_slope","bottom_slope",
-                        "ru_area","ru_result","rd_area","rd_result","result_img"]
-
-                if ok_capture and img_tmp_path:
-                    try:
-                        res=analyze_image(
-                            img_tmp_path,
-                            trim_ratio_x=self.trim_ratio_x.get(),
-                            trim_ratio_y=self.trim_ratio_y.get(),
-                            diff_thresh=self.diff_thresh.get(),
-                            flip_horizontal=bool(self.flip_horizontal.get()),
-                            band_top=self.band_top.get(),
-                            band_right=self.band_right.get(),
-                            band_bottom=self.band_bottom.get(),
-                            corner_exclude_x_px=self.corner_exclude_x_px.get(),
-                            corner_exclude_y_px=self.corner_exclude_y_px.get()
-                        )
-                        ru_notch=(res["ru_result"]=="NOTCH"); rd_notch=(res["rd_result"]=="NOTCH")
-                        self._post_preview(img_tmp_path, res)
-                        self.file_paths.append(img_tmp_path); self._post_list_add(img_tmp_path)
-
-                        result_img_path = save_result_image(res["img_bgr"], img_tmp_path, self.output_dir or os.path.dirname(img_tmp_path))
-                        row=[os.path.basename(img_tmp_path), os.path.dirname(img_tmp_path),
-                             self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
-                             int(bool(self.flip_horizontal.get())),
-                             self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
-                             self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
-                             res["top_angle_deg"], res["side_angle_deg"], res["bottom_angle_deg"],
-                             res["top_slope"], res["side_slope"], res["bottom_slope"],
-                             res["ru_area"], res["ru_result"], res["rd_area"], res["rd_result"],
-                             result_img_path or ""]
-                        self._append_result_csv(csv_path, header, row)
-                    except Exception as e:
-                        an_error=True
-                        self._post_status(f"解析エラー: {e}")
-                        row=[os.path.basename(img_tmp_path) if img_tmp_path else "",
-                             os.path.dirname(img_tmp_path) if img_tmp_path else "",
-                             self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
-                             int(bool(self.flip_horizontal.get())),
-                             self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
-                             self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
-                             "", "", "", "", "", "",
-                             -1, "ERROR_ANALYZE", -1, "ERROR_ANALYZE", ""]
-                        self._append_result_csv(csv_path, header, row)
-                else:
-                    to_error=True
-                    row=["", self.cfg.plc_shot_dir or tempfile.gettempdir(),
-                         self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
-                         int(bool(self.flip_horizontal.get())),
-                         self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
-                         self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
-                         "", "", "", "", "", "",
-                         -1, "ERROR_TIMEOUT" if (error_type=="TIMEOUT") else "ERROR_CAPTURE",
-                         -1, "ERROR_TIMEOUT" if (error_type=="TIMEOUT") else "ERROR_CAPTURE",
-                         ""]
-                    self._append_result_csv(csv_path, header, row)
-
-                # PLCへ返答
-                try:
-                    self.plc.write_bit(self.var_dev_ru.get().strip(), bool(ru_notch))
-                    self.plc.write_bit(self.var_dev_rd.get().strip(), bool(rd_notch))
-                    if to_error: self.plc.write_bit(self.var_dev_err_to.get().strip(), True)
-                    if an_error: self.plc.write_bit(self.var_dev_err_an.get().strip(), True)
-                except Exception as e:
-                    self._post_status(f"結果/エラー書込エラー: {e}")
-
-                # 完了パルス
-                try:
-                    self.plc.pulse_bit(self.var_dev_done.get().strip(), self.var_done_ms.get())
-                except Exception as e:
-                    self._post_status(f"完了パルスエラー: {e}")
-
-                self._safe_plc(lambda: self.plc.write_bit(self.var_dev_busy.get().strip(), False), quiet=True)
-                self._post_status(f"返答: RU={int(ru_notch)} RD={int(rd_notch)} TO_ERR={int(to_error)} AN_ERR={int(an_error)}")
+                self._queue_trigger(time.monotonic())
 
             self.prev_trig=trig
             time.sleep(poll)
 
+    def _plc_worker_loop(self):
+        while not self.plc_stop:
+            try:
+                item = self.trigger_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self._handle_plc_trigger(item)
+            except Exception:
+                LOGGER.exception("Unexpected error in trigger worker")
+            finally:
+                self.trigger_queue.task_done()
+
+    def _handle_plc_trigger(self, trig_item):
+        start_ts = time.monotonic()
+        detected_ts = float(trig_item.get("detected_ts", start_ts))
+        trigger_lag_ms = (start_ts - detected_ts) * 1000.0
+        self._post_status("トリガ検出: 撮像→解析→返答")
+        self._safe_plc(lambda: self.plc.write_bit(self.var_dev_busy.get().strip(), True), quiet=True)
+        self._safe_plc(lambda: self.plc.write_bit(self.var_dev_err_to.get().strip(), False), quiet=True)
+        self._safe_plc(lambda: self.plc.write_bit(self.var_dev_err_an.get().strip(), False), quiet=True)
+
+        ok_capture=True; img_tmp_path=None
+        error_type=None
+        capture_ms=0.0; analyze_ms=0.0; csv_ms=0.0
+        try:
+            shot_dir = self.cfg.plc_shot_dir if self.cfg.plc_shot_dir else tempfile.gettempdir()
+            os.makedirs(shot_dir, exist_ok=True)
+            ts=time.strftime("%Y%m%d_%H%M%S")
+            img_tmp_path=os.path.join(shot_dir, f"PLCshot_{ts}.png")
+
+            t_cap = time.monotonic()
+            img_bgr = self._cam_snap_bgr()
+
+            ok, buf=cv2.imencode(".png", img_bgr)
+            if ok:
+                buf.tofile(img_tmp_path)
+                self._auto_cleanup_temp_files()
+            else:
+                ok_capture=False
+                error_type="CAPTURE"
+            capture_ms = (time.monotonic() - t_cap) * 1000.0
+        except Exception as e:
+            ok_capture=False
+            msg=str(e).lower()
+            error_type = "TIMEOUT" if ("timeout" in msg or "time out" in msg) else "CAPTURE"
+            self._post_status(f"撮像エラー: {e}")
+            self._cam_close_and_null()
+            capture_ms = (time.monotonic() - t_cap) * 1000.0 if 't_cap' in locals() else 0.0
+
+        ru_notch=False; rd_notch=False; to_error=False; an_error=False
+        csv_path=self._get_result_csv_path()
+        header=["filename","folderpath","trim_ratio_x","trim_ratio_y","diff_thresh","flip_horizontal",
+                "band_top","band_right","band_bottom","corner_exclude_x_px","corner_exclude_y_px",
+                "top_angle_deg","side_angle_deg","bottom_angle_deg",
+                "top_slope","side_slope","bottom_slope",
+                "ru_area","ru_result","rd_area","rd_result","result_img"]
+
+        if ok_capture and img_tmp_path:
+            try:
+                t_an = time.monotonic()
+                res=analyze_image(
+                    img_tmp_path,
+                    trim_ratio_x=self.trim_ratio_x.get(),
+                    trim_ratio_y=self.trim_ratio_y.get(),
+                    diff_thresh=self.diff_thresh.get(),
+                    flip_horizontal=bool(self.flip_horizontal.get()),
+                    band_top=self.band_top.get(),
+                    band_right=self.band_right.get(),
+                    band_bottom=self.band_bottom.get(),
+                    corner_exclude_x_px=self.corner_exclude_x_px.get(),
+                    corner_exclude_y_px=self.corner_exclude_y_px.get()
+                )
+                analyze_ms = (time.monotonic() - t_an) * 1000.0
+                ru_notch=(res["ru_result"]=="NOTCH"); rd_notch=(res["rd_result"]=="NOTCH")
+                self._post_preview(img_tmp_path, res)
+                self.file_paths.append(img_tmp_path); self._post_list_add(img_tmp_path)
+
+                t_csv = time.monotonic()
+                result_img_path = save_result_image(res["img_bgr"], img_tmp_path, self.output_dir or os.path.dirname(img_tmp_path))
+                row=[os.path.basename(img_tmp_path), os.path.dirname(img_tmp_path),
+                     self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
+                     int(bool(self.flip_horizontal.get())),
+                     self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
+                     self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
+                     res["top_angle_deg"], res["side_angle_deg"], res["bottom_angle_deg"],
+                     res["top_slope"], res["side_slope"], res["bottom_slope"],
+                     res["ru_area"], res["ru_result"], res["rd_area"], res["rd_result"],
+                     result_img_path or ""]
+                self._append_result_csv(csv_path, header, row)
+                csv_ms = (time.monotonic() - t_csv) * 1000.0
+            except Exception as e:
+                an_error=True
+                self._post_status(f"解析エラー: {e}")
+                t_csv = time.monotonic()
+                row=[os.path.basename(img_tmp_path) if img_tmp_path else "",
+                     os.path.dirname(img_tmp_path) if img_tmp_path else "",
+                     self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
+                     int(bool(self.flip_horizontal.get())),
+                     self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
+                     self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
+                     "", "", "", "", "", "",
+                     -1, "ERROR_ANALYZE", -1, "ERROR_ANALYZE", ""]
+                self._append_result_csv(csv_path, header, row)
+                csv_ms = (time.monotonic() - t_csv) * 1000.0
+        else:
+            to_error=True
+            t_csv = time.monotonic()
+            row=["", self.cfg.plc_shot_dir or tempfile.gettempdir(),
+                 self.trim_ratio_x.get(), self.trim_ratio_y.get(), self.diff_thresh.get(),
+                 int(bool(self.flip_horizontal.get())),
+                 self.band_top.get(), self.band_right.get(), self.band_bottom.get(),
+                 self.corner_exclude_x_px.get(), self.corner_exclude_y_px.get(),
+                 "", "", "", "", "", "",
+                 -1, "ERROR_TIMEOUT" if (error_type=="TIMEOUT") else "ERROR_CAPTURE",
+                 -1, "ERROR_TIMEOUT" if (error_type=="TIMEOUT") else "ERROR_CAPTURE",
+                 ""]
+            self._append_result_csv(csv_path, header, row)
+            csv_ms = (time.monotonic() - t_csv) * 1000.0
+
+        # PLCへ返答
+        try:
+            with self._plc_lock:
+                self.plc.write_bit(self.var_dev_ru.get().strip(), bool(ru_notch))
+                self.plc.write_bit(self.var_dev_rd.get().strip(), bool(rd_notch))
+                if to_error: self.plc.write_bit(self.var_dev_err_to.get().strip(), True)
+                if an_error: self.plc.write_bit(self.var_dev_err_an.get().strip(), True)
+        except Exception as e:
+            self._post_status(f"結果/エラー書込エラー: {e}")
+
+        # 完了パルス
+        try:
+            with self._plc_lock:
+                self.plc.pulse_bit(self.var_dev_done.get().strip(), self.var_done_ms.get())
+        except Exception as e:
+            self._post_status(f"完了パルスエラー: {e}")
+
+        self._safe_plc(lambda: self.plc.write_bit(self.var_dev_busy.get().strip(), False), quiet=True)
+        total_ms = (time.monotonic() - start_ts) * 1000.0
+        LOGGER.info(
+            "PLC trigger metrics id=%s lag_ms=%.1f capture_ms=%.1f analyze_ms=%.1f csv_ms=%.1f total_ms=%.1f queue=%s",
+            trig_item.get("id"), trigger_lag_ms, capture_ms, analyze_ms, csv_ms, total_ms, self.trigger_queue.qsize()
+        )
+        self._post_status(f"返答: RU={int(ru_notch)} RD={int(rd_notch)} TO_ERR={int(to_error)} AN_ERR={int(an_error)}")
     # ---------- ハートビート ----------
     def _hb_start_if_needed(self):
         if not self.plc_connected: return
@@ -1592,7 +1663,8 @@ class NotchApp(ttk.Window):
         if self.hb_thread and self.hb_thread.is_alive(): return
         self.hb_stop=False
         try:
-            self.hb_value=self.plc.read_word(self.var_dev_alive.get().strip())
+            with self._plc_lock:
+                self.hb_value=self.plc.read_word(self.var_dev_alive.get().strip())
         except Exception:
             self.hb_value=0
         self.hb_thread=threading.Thread(target=self._hb_loop, daemon=True); self.hb_thread.start()
@@ -1614,7 +1686,8 @@ class NotchApp(ttk.Window):
                 interval=max(10, int(self.var_alive_ms.get()))
                 step=max(1, int(self.var_alive_step.get()))
                 self.hb_value=(self.hb_value+step)&0xFFFF
-                self.plc.write_word(self.var_dev_alive.get().strip(), self.hb_value)
+                with self._plc_lock:
+                    self.plc.write_word(self.var_dev_alive.get().strip(), self.hb_value)
             except Exception as e:
                 now=time.monotonic()
                 if now-last_err>1.5:
@@ -1678,13 +1751,15 @@ class NotchApp(ttk.Window):
                 # 監視中の断検知（PLC）
                 if self.plc_thread and self.plc_thread.is_alive():
                     try:
-                        _ = self.plc.read_bit(self.var_dev_trig.get().strip())
+                        with self._plc_lock:
+                            _ = self.plc.read_bit(self.var_dev_trig.get().strip())
                     except Exception as e:
                         self._post_status(f"PLC通信断検知: {e}")
                         self._hb_stop()
                         self.on_plc_watch_stop(manual=False)
                         try:
-                            if self.plc: self.plc.close()
+                            with self._plc_lock:
+                                if self.plc: self.plc.close()
                         except: pass
                         self.plc_connected=False
                 time.sleep(0.8)
@@ -1731,7 +1806,8 @@ class NotchApp(ttk.Window):
 
     def _safe_plc(self, func, quiet=False):
         try:
-            func()
+            with self._plc_lock:
+                func()
             if not quiet: self._post_status("PLC OK")
         except Exception as e:
             if not quiet: self._post_status(f"[PLCエラー] {e}")
@@ -1792,7 +1868,9 @@ class NotchApp(ttk.Window):
             self.on_plc_watch_stop(manual=True)
             self._hb_stop()
             if self.plc_connected and self.plc:
-                try: self.plc.close()
+                try:
+                    with self._plc_lock:
+                        self.plc.close()
                 except: pass
             if self.basler is not None:
                 try: self.basler.close()
