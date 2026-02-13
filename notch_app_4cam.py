@@ -7,10 +7,12 @@
 """
 
 import os
+import csv
 import json
 import time
 import threading
 import tempfile
+import cv2
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
 
@@ -45,7 +47,21 @@ class CameraParam:
 
     dev_ru: str = "M101"
     dev_rd: str = "M102"
+    dev_done: str = "M111"
+    dev_err_to: str = "M121"
+    dev_err_an: str = "M131"
+    csv_filename: str = "result_cam1.csv"
 
+
+
+
+def _default_cams():
+    return [
+        CameraParam(camera_index=0, dev_ru="M101", dev_rd="M102", dev_done="M111", dev_err_to="M121", dev_err_an="M131", csv_filename="result_cam1.csv"),
+        CameraParam(camera_index=1, dev_ru="M103", dev_rd="M104", dev_done="M112", dev_err_to="M122", dev_err_an="M132", csv_filename="result_cam2.csv"),
+        CameraParam(camera_index=2, dev_ru="M105", dev_rd="M106", dev_done="M113", dev_err_to="M123", dev_err_an="M133", csv_filename="result_cam3.csv"),
+        CameraParam(camera_index=3, dev_ru="M107", dev_rd="M108", dev_done="M114", dev_err_to="M124", dev_err_an="M134", csv_filename="result_cam4.csv"),
+    ]
 
 @dataclass
 class AppConfig4Cam:
@@ -64,16 +80,21 @@ class AppConfig4Cam:
     plc_shot_dir: str = ""
     auto_reconnect: bool = True
 
-    cams: list[CameraParam] = field(default_factory=lambda: [CameraParam() for _ in range(4)])
+    cams: list[CameraParam] = field(default_factory=_default_cams)
 
     @staticmethod
     def load():
         try:
             with open(CONFIG_PATH_4CAM, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            cams = [CameraParam(**x) for x in data.get("cams", [])]
+            base = _default_cams()
+            cams = []
+            for i, x in enumerate(data.get("cams", [])):
+                b = asdict(base[i]) if i < len(base) else asdict(CameraParam())
+                b.update(x)
+                cams.append(CameraParam(**b))
             if len(cams) < 4:
-                cams.extend([CameraParam() for _ in range(4 - len(cams))])
+                cams.extend(base[len(cams):4])
             data["cams"] = cams[:4]
             return AppConfig4Cam(**{k: v for k, v in data.items() if k != "cams"}, cams=data["cams"])
         except Exception:
@@ -103,6 +124,7 @@ class NotchApp4Cam(ttk.Window):
         self.plc_stop = False
         self.prev_trig = False
         self._plc_lock = threading.RLock()
+        self._csv_lock = threading.RLock()
 
         self.cameras = [None, None, None, None]
         self._cam_locks = [threading.RLock() for _ in range(4)]
@@ -136,6 +158,10 @@ class NotchApp4Cam(ttk.Window):
                 "corner_exclude_y_px": tk.IntVar(value=c.corner_exclude_y_px),
                 "dev_ru": tk.StringVar(value=c.dev_ru),
                 "dev_rd": tk.StringVar(value=c.dev_rd),
+                "dev_done": tk.StringVar(value=c.dev_done),
+                "dev_err_to": tk.StringVar(value=c.dev_err_to),
+                "dev_err_an": tk.StringVar(value=c.dev_err_an),
+                "csv_filename": tk.StringVar(value=c.csv_filename),
             })
 
         self._build_ui()
@@ -214,10 +240,20 @@ class NotchApp4Cam(ttk.Window):
             ttk.Entry(r2, textvariable=v[key], width=w).pack(side="left", padx=2)
 
         r3 = ttk.Frame(parent); r3.pack(fill="x", pady=2)
-        ttk.Label(r3, text="結果RUデバイス").pack(side="left")
-        ttk.Entry(r3, textvariable=v["dev_ru"], width=12).pack(side="left", padx=4)
-        ttk.Label(r3, text="結果RDデバイス").pack(side="left")
-        ttk.Entry(r3, textvariable=v["dev_rd"], width=12).pack(side="left", padx=4)
+        ttk.Label(r3, text="結果RU").pack(side="left")
+        ttk.Entry(r3, textvariable=v["dev_ru"], width=10).pack(side="left", padx=4)
+        ttk.Label(r3, text="結果RD").pack(side="left")
+        ttk.Entry(r3, textvariable=v["dev_rd"], width=10).pack(side="left", padx=4)
+        ttk.Label(r3, text="DONE").pack(side="left")
+        ttk.Entry(r3, textvariable=v["dev_done"], width=10).pack(side="left", padx=4)
+
+        r4 = ttk.Frame(parent); r4.pack(fill="x", pady=2)
+        ttk.Label(r4, text="ERR_TO").pack(side="left")
+        ttk.Entry(r4, textvariable=v["dev_err_to"], width=10).pack(side="left", padx=4)
+        ttk.Label(r4, text="ERR_AN").pack(side="left")
+        ttk.Entry(r4, textvariable=v["dev_err_an"], width=10).pack(side="left", padx=4)
+        ttk.Label(r4, text="CSV").pack(side="left")
+        ttk.Entry(r4, textvariable=v["csv_filename"], width=24).pack(side="left", padx=4)
 
     def _bind_traces(self):
         def on_change(*_):
@@ -267,6 +303,10 @@ class NotchApp4Cam(ttk.Window):
                 corner_exclude_y_px=int(v["corner_exclude_y_px"].get()),
                 dev_ru=v["dev_ru"].get().strip(),
                 dev_rd=v["dev_rd"].get().strip(),
+                dev_done=v["dev_done"].get().strip(),
+                dev_err_to=v["dev_err_to"].get().strip(),
+                dev_err_an=v["dev_err_an"].get().strip(),
+                csv_filename=v["csv_filename"].get().strip() or "result.csv",
             ))
         self.cfg.cams = cams
 
@@ -275,6 +315,20 @@ class NotchApp4Cam(ttk.Window):
         self.txt_status.configure(state="normal")
         self.txt_status.insert("1.0", line + "\n")
         self.txt_status.configure(state="disabled")
+
+    def _append_cam_csv(self, cam_no, cam_cfg, row):
+        base = self.cfg.output_dir or self.cfg.plc_shot_dir or tempfile.gettempdir()
+        os.makedirs(base, exist_ok=True)
+        filename = cam_cfg.csv_filename.strip() if cam_cfg.csv_filename else f"result_cam{cam_no+1}.csv"
+        csv_path = os.path.join(base, filename)
+        header = ["timestamp", "camera_no", "filename", "ru_result", "rd_result", "ru_area", "rd_area", "error"]
+        with self._csv_lock:
+            exists = os.path.isfile(csv_path)
+            with open(csv_path, "a", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                if not exists:
+                    w.writerow(header)
+                w.writerow(row)
 
     def _cam_open_if_needed(self, idx):
         with self._cam_locks[idx]:
@@ -368,57 +422,97 @@ class NotchApp4Cam(ttk.Window):
             self.plc.write_bit(self.cfg.dev_err_to, False)
             self.plc.write_bit(self.cfg.dev_err_an, False)
 
-        to_error = False
-        an_error = False
+        captures = [{} for _ in range(4)]
 
-        for i, c in enumerate(self.cfg.cams):
-            ru = False
-            rd = False
+        def _capture_worker(i):
+            c = self.cfg.cams[i]
             try:
                 bgr = self._cam_snap(i)
                 shot_dir = self.cfg.plc_shot_dir or tempfile.gettempdir()
                 os.makedirs(shot_dir, exist_ok=True)
                 shot_path = os.path.join(shot_dir, f"PLCshot_cam{i+1}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png")
-                import cv2
                 ok, buf = cv2.imencode('.png', bgr)
-                if ok:
-                    buf.tofile(shot_path)
-
-                res = analyze_image(
-                    shot_path,
-                    trim_ratio_x=c.trim_ratio_x,
-                    trim_ratio_y=c.trim_ratio_y,
-                    diff_thresh=c.diff_thresh,
-                    flip_horizontal=c.flip_horizontal,
-                    band_top=c.band_top,
-                    band_right=c.band_right,
-                    band_bottom=c.band_bottom,
-                    corner_exclude_x_px=c.corner_exclude_x_px,
-                    corner_exclude_y_px=c.corner_exclude_y_px,
-                )
-                ru = (res["ru_result"] == "NOTCH")
-                rd = (res["rd_result"] == "NOTCH")
+                if not ok:
+                    raise RuntimeError("画像エンコード失敗")
+                buf.tofile(shot_path)
+                captures[i] = {"ok": True, "path": shot_path}
             except Exception as e:
-                an_error = True
-                self._post_status(f"Cam{i+1} 解析エラー: {e}")
+                captures[i] = {"ok": False, "err": str(e)}
+
+        workers = [threading.Thread(target=_capture_worker, args=(i,), daemon=True) for i in range(4)]
+        for t in workers:
+            t.start()
+        for t in workers:
+            t.join()
+
+        any_to_error = False
+        any_an_error = False
+
+        for i, c in enumerate(self.cfg.cams):
+            ru = False
+            rd = False
+            to_error = False
+            an_error = False
+            ru_area = -1
+            rd_area = -1
+            shot_path = captures[i].get("path", "")
+            err_msg = ""
+
+            if captures[i].get("ok"):
+                try:
+                    res = analyze_image(
+                        shot_path,
+                        trim_ratio_x=c.trim_ratio_x,
+                        trim_ratio_y=c.trim_ratio_y,
+                        diff_thresh=c.diff_thresh,
+                        flip_horizontal=c.flip_horizontal,
+                        band_top=c.band_top,
+                        band_right=c.band_right,
+                        band_bottom=c.band_bottom,
+                        corner_exclude_x_px=c.corner_exclude_x_px,
+                        corner_exclude_y_px=c.corner_exclude_y_px,
+                    )
+                    ru = (res["ru_result"] == "NOTCH")
+                    rd = (res["rd_result"] == "NOTCH")
+                    ru_area = int(res["ru_area"])
+                    rd_area = int(res["rd_area"])
+                except Exception as e:
+                    an_error = True
+                    err_msg = f"ANALYZE:{e}"
+                    self._post_status(f"Cam{i+1} 解析エラー: {e}")
+            else:
+                to_error = True
+                err_msg = f"CAPTURE:{captures[i].get('err', '')}"
+                self._post_status(f"Cam{i+1} 撮像エラー: {captures[i].get('err', '')}")
 
             try:
                 with self._plc_lock:
                     self.plc.write_bit(c.dev_ru, ru)
                     self.plc.write_bit(c.dev_rd, rd)
+                    self.plc.write_bit(c.dev_err_to, to_error)
+                    self.plc.write_bit(c.dev_err_an, an_error)
+                    self.plc.pulse_bit(c.dev_done, self.cfg.done_ms)
             except Exception as e:
                 to_error = True
+                err_msg = (err_msg + " | " if err_msg else "") + f"WRITE:{e}"
                 self._post_status(f"Cam{i+1} PLC書込エラー: {e}")
 
+            any_to_error = any_to_error or to_error
+            any_an_error = any_an_error or an_error
+
+            self._append_cam_csv(i, c, [
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                i + 1,
+                os.path.basename(shot_path) if shot_path else "",
+                int(ru), int(rd), ru_area, rd_area, err_msg,
+            ])
+
         with self._plc_lock:
-            if to_error:
-                self.plc.write_bit(self.cfg.dev_err_to, True)
-            if an_error:
-                self.plc.write_bit(self.cfg.dev_err_an, True)
-            self.plc.pulse_bit(self.cfg.dev_done, self.cfg.done_ms)
+            self.plc.write_bit(self.cfg.dev_err_to, any_to_error)
+            self.plc.write_bit(self.cfg.dev_err_an, any_an_error)
             self.plc.write_bit(self.cfg.dev_busy, False)
 
-        self._post_status(f"4カメラ返答完了 TO_ERR={int(to_error)} AN_ERR={int(an_error)}")
+        self._post_status(f"4カメラ返答完了 TO_ERR={int(any_to_error)} AN_ERR={int(any_an_error)}")
 
     def destroy(self):
         try:
