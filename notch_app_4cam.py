@@ -708,7 +708,7 @@ class NotchApp4Cam(ttk.Window):
     def _open_plc_common_settings(self):
         win = tk.Toplevel(self)
         win.title("PLC共通設定")
-        win.geometry("780x260")
+        win.geometry("980x360")
         win.transient(self)
 
         frm = ttk.Frame(win, padding=10)
@@ -823,10 +823,16 @@ class NotchApp4Cam(ttk.Window):
         self.cam_vars[cam_idx]["camera_index"].set(int(idx))
 
     def _build_cam_tab(self, parent, v, cam_idx):
-        r1 = ttk.Frame(parent); r1.pack(fill="x", pady=2)
+        body = ttk.Frame(parent)
+        body.pack(fill="both", expand=True)
+
+        ctrl = ttk.Labelframe(body, text="画像処理パラメータ", padding=8)
+        ctrl.pack(side="left", fill="both", expand=True, padx=(0, 6))
+
+        r1 = ttk.Frame(ctrl); r1.pack(fill="x", pady=2)
         ttk.Checkbutton(r1, text="左右反転", variable=v["flip_horizontal"]).pack(side="left", padx=10)
 
-        r2 = ttk.Frame(parent); r2.pack(fill="x", pady=2)
+        r2 = ttk.Frame(ctrl); r2.pack(fill="x", pady=2)
         for key, label, w in [
             ("trim_ratio_x", "trim_x", 6), ("trim_ratio_y", "trim_y", 6), ("diff_thresh", "th", 8),
             ("band_top", "band_top", 6), ("band_right", "band_right", 6), ("band_bottom", "band_bottom", 6),
@@ -835,14 +841,14 @@ class NotchApp4Cam(ttk.Window):
             ttk.Label(r2, text=label).pack(side="left")
             ttk.Entry(r2, textvariable=v[key], width=w).pack(side="left", padx=2)
 
-        r5 = ttk.Frame(parent); r5.pack(fill="x", pady=(6, 4))
+        r5 = ttk.Frame(ctrl); r5.pack(fill="x", pady=(8, 4))
         ttk.Button(r5, text="撮像", bootstyle=PRIMARY, command=lambda i=cam_idx: self.on_cam_snap(i)).pack(side="left")
         ttk.Button(r5, text="連続Grab開始", bootstyle=SUCCESS, command=lambda i=cam_idx: self.on_cam_grab_start(i)).pack(side="left", padx=4)
         ttk.Button(r5, text="連続Grab停止", bootstyle=WARNING, command=lambda i=cam_idx: self.on_cam_grab_stop(i)).pack(side="left")
 
-        preview = ttk.Labelframe(parent, text="プレビュー", padding=6)
-        preview.pack(fill="both", expand=True, pady=(4, 0))
-        canvas = tk.Canvas(preview, width=420, height=260, bg="#111111", highlightthickness=1, highlightbackground="#444444")
+        preview = ttk.Labelframe(body, text="プレビュー", padding=6)
+        preview.pack(side="left", fill="both", expand=True)
+        canvas = tk.Canvas(preview, width=520, height=320, bg="#111111", highlightthickness=1, highlightbackground="#444444")
         canvas.pack(fill="both", expand=True)
         result_var = tk.StringVar(value="未撮像")
         ttk.Label(preview, textvariable=result_var, justify="left", anchor="w").pack(fill="x", pady=(4, 0))
