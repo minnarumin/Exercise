@@ -826,8 +826,9 @@ class NotchApp4Cam(ttk.Window):
         body = ttk.Frame(parent)
         body.pack(fill="both", expand=True)
 
-        ctrl = ttk.Labelframe(body, text="画像処理パラメータ", padding=8)
-        ctrl.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        ctrl = ttk.Labelframe(body, text="画像処理パラメータ", padding=8, width=420)
+        ctrl.pack(side="left", fill="y", expand=False, padx=(0, 6))
+        ctrl.pack_propagate(False)
 
         r1 = ttk.Frame(ctrl); r1.pack(fill="x", pady=2)
         ttk.Checkbutton(r1, text="左右反転", variable=v["flip_horizontal"]).pack(side="left", padx=10)
@@ -848,7 +849,7 @@ class NotchApp4Cam(ttk.Window):
 
         preview = ttk.Labelframe(body, text="プレビュー", padding=6)
         preview.pack(side="left", fill="both", expand=True)
-        canvas = tk.Canvas(preview, width=520, height=320, bg="#111111", highlightthickness=1, highlightbackground="#444444")
+        canvas = tk.Canvas(preview, width=640, height=360, bg="#111111", highlightthickness=1, highlightbackground="#444444")
         canvas.pack(fill="both", expand=True)
         result_var = tk.StringVar(value="未撮像")
         ttk.Label(preview, textvariable=result_var, justify="left", anchor="w").pack(fill="x", pady=(4, 0))
