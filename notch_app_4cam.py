@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-4カメラ版 ガラス基板ノッチ判定ツール
-- 共通PLCトリガで4台のカメラを順次撮像・解析
+4カメラ版 ガラス基板ノッチ判定ツール（単独動作版）
+- 共通PLCトリガで4台のカメラを同時撮像・解析
 - カメラごとに解析パラメータを設定可能
-- 判定結果RU/RDはカメラごとに別デバイスへ書込み
+- 判定結果RU/RD/DONE/ERRはカメラごとに別デバイスへ書込み
 """
 
 import os
@@ -13,6 +13,26 @@ import time
 import threading
 import tempfile
 import cv2
+import numpy as np
+import re
+import logging
+
+LOGGER = logging.getLogger("notch_app_4cam")
+if not LOGGER.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+# ====== オプション依存（存在チェック） ======
+try:
+    from pypylon import pylon
+    HAS_PYLYON = True
+except Exception:
+    HAS_PYLYON = False
+
+try:
+    import pymcprotocol
+    HAS_PYMC = True
+except Exception:
+    HAS_PYMC = False
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
 
@@ -20,13 +40,446 @@ import tkinter as tk
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 
-from notch_app import (
-    analyze_image,
-    BaslerCamera,
-    PLCClient,
-    HAS_PYLYON,
-    HAS_PYMC,
-)
+def imread_unicode(filename):
+    data = np.fromfile(filename, dtype=np.uint8)
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+def _fit_line_L2(points_xy):
+    pts = points_xy.astype(np.float32).reshape(-1,1,2)
+    vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+    return float(vx.ravel()[0]), float(vy.ravel()[0]), float(x0.ravel()[0]), float(y0.ravel()[0])
+
+def _line_params_abc(vx, vy, x0, y0):
+    a, b = vy, -vx
+    c = -(a*x0 + b*y0)
+    s = np.hypot(a, b)
+    if s == 0: return 0.0, 0.0, 0.0
+    return a/s, b/s, c/s
+
+def _line_angle_deg(vx, vy):
+    return float(np.degrees(np.arctan2(vy, vx)))
+
+def _line_intersection(a1,b1,c1, a2,b2,c2):
+    d = a1*b2 - a2*b1
+    if abs(d) < 1e-9: return None
+    x = (b1*c2 - b2*c1)/d
+    y = (c1*a2 - c2*a1)/d
+    return np.array([x,y], np.float32)
+
+def _line_endpoints(a, b, c, width, height):
+    pts=[]
+    if abs(b)>1e-9:
+        for X in (0, width-1):
+            Y=int(round(-(a*X+c)/b)); pts.append((X,Y))
+    if abs(a)>1e-9:
+        for Y in (0, height-1):
+            X=int(round(-(b*Y+c)/a)); pts.append((X,Y))
+    pts_in=[p for p in pts if 0<=p[0]<width and 0<=p[1]<height]
+    if len(pts_in)>=2:
+        return pts_in[0], pts_in[1]
+    return None, None
+
+def _unit(v):
+    n = np.linalg.norm(v)
+    return v/n if n>1e-9 else v
+
+def _clip_polygon_to_image(poly_pts, w, h):
+    def intersection(A,B,edge):
+        Ax,Ay = A; Bx,By = B
+        if edge is left:
+            t=(0-Ax)/(Bx-Ax+1e-12); return np.array([0, Ay+t*(By-Ay)], np.float32)
+        if edge is right:
+            t=((w-1)-Ax)/(Bx-Ax+1e-12); return np.array([w-1, Ay+t*(By-Ay)], np.float32)
+        if edge is top:
+            t=(0-Ay)/(By-Ay+1e-12); return np.array([Ax+t*(Bx-Ax), 0], np.float32)
+        if edge is bottom:
+            t=((h-1)-Ay)/(By-Ay+1e-12); return np.array([Ax+t*(Bx-Ax), h-1], np.float32)
+
+    def clip_edge(points, edge):
+        res=[]
+        for i in range(len(points)):
+            A=points[i]; B=points[(i+1)%len(points)]
+            Ain=edge(A); Bin=edge(B)
+            if Ain and Bin: res.append(B)
+            elif Ain and not Bin: res.append(intersection(A,B,edge))
+            elif (not Ain) and Bin: res.append(intersection(A,B,edge)); res.append(B)
+        return res
+
+    left   = lambda P: P[0] >= 0
+    right  = lambda P: P[0] <= w-1
+    top    = lambda P: P[1] >= 0
+    bottom = lambda P: P[1] <= h-1
+
+    pts=[p.astype(np.float32) for p in poly_pts]
+    for edge in (left,right,top,bottom):
+        if not pts: break
+        pts = clip_edge(pts, edge)
+    return np.array(pts, np.float32) if len(pts)>=3 else np.empty((0,2), np.float32)
+
+def _extract_edge_points(mask_real, band, side, exclude_x_px, exclude_y_px, bbox):
+    edges=cv2.Canny(mask_real, 50, 150)
+    y_idx, x_idx = np.where(edges>0)
+    x, y = x_idx.astype(np.int32), y_idx.astype(np.int32)
+    x0, y0, bw, bh = bbox
+    x1 = x0 + bw - 1; y1 = y0 + bh - 1
+    if side=='top':
+        y_min=max(0,y0); y_max=max(0,min(y1, y0+band))
+        sel=(y>=y_min)&(y<=y_max)
+        sel&=(x>=x0+int(exclude_x_px))&(x<=x1-int(exclude_x_px))
+    elif side=='right':
+        x_min=max(0, x1-band)
+        sel=(x>=x_min)&(x<=x1)
+        sel&=(y>=y0+int(exclude_y_px))&(y<=y1-int(exclude_y_px))
+    elif side=='bottom':
+        y_min=max(0, y1-band)
+        sel=(y>=y_min)&(y<=y1)
+        sel&=(x>=x0+int(exclude_x_px))&(x<=x1-int(exclude_x_px))
+    else:
+        raise ValueError("side must be 'top'|'right'|'bottom'")
+    xs=x[sel].astype(np.float32); ys=y[sel].astype(np.float32)
+    if xs.size<50: return np.empty((0,2), np.float32)
+    return np.stack([xs,ys], axis=1)
+
+def _make_corner_quad_from_lines(top_abc, right_abc, trim_x_px, trim_y_px, img_shape):
+    a1,b1,c1=top_abc; a2,b2,c2=right_abc
+    P=_line_intersection(a1,b1,c1, a2,b2,c2)
+    if P is None: return np.empty((0,2), np.float32)
+    t_top=_unit(np.array([-b1,a1],np.float32))
+    t_right=_unit(np.array([-b2,a2],np.float32))
+    if t_top[0]>0: t_top=-t_top
+    if t_right[1]<0: t_right=-t_right
+    p0=P; p1=P+t_right*trim_y_px; p2=p1+t_top*trim_x_px; p3=P+t_top*trim_x_px
+    quad=np.array([p0,p1,p2,p3],np.float32)
+    h,w=img_shape[:2]
+    return _clip_polygon_to_image(quad, w, h)
+
+def _make_corner_rd(right_abc, bottom_abc, trim_x_px, trim_y_px, img_shape):
+    aR,bR,cR=right_abc; aB,bB,cB=bottom_abc
+    P=_line_intersection(aR,bR,cR, aB,bB,cB)
+    if P is None: return np.empty((0,2), np.float32)
+    t_bottom=_unit(np.array([-bB,aB],np.float32))
+    t_right =_unit(np.array([-bR,aR],np.float32))
+    if t_bottom[0]>0: t_bottom=-t_bottom
+    if t_right[1]>0:  t_right=-t_right
+    p0=P; p1=P+t_right*trim_y_px; p2=p1+t_bottom*trim_x_px; p3=P+t_bottom*trim_x_px
+    quad=np.array([p0,p1,p2,p3],np.float32)
+    h,w=img_shape[:2]
+    return _clip_polygon_to_image(quad, w, h)
+
+def analyze_image(
+    filepath,
+    trim_ratio_x=0.25, trim_ratio_y=0.12, diff_thresh=15000,
+    flip_horizontal=False,
+    band_top=10, band_right=10, band_bottom=10,
+    corner_exclude_x_px=200, corner_exclude_y_px=25
+):
+    img = imread_unicode(filepath)
+    if img is None: raise RuntimeError(f"画像の読み込みに失敗: {filepath}")
+    if flip_horizontal:
+        img=cv2.flip(img, 1)
+    gray=cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur=cv2.GaussianBlur(gray,(5,5),0)
+    _,bin_img=cv2.threshold(blur,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    bin_inv = 255 - bin_img
+    contours,_=cv2.findContours(bin_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: raise RuntimeError(f"輪郭が検出できません: {filepath}")
+    main_cnt=max(contours, key=cv2.contourArea)
+    mask_real=np.zeros_like(bin_inv); cv2.drawContours(mask_real,[main_cnt],0,255,-1)
+
+    rx=np.clip(float(trim_ratio_x),0.0,0.95); ry=np.clip(float(trim_ratio_y),0.0,0.95)
+    x0,y0,bw,bh=cv2.boundingRect(main_cnt)
+
+    pts_top   = _extract_edge_points(mask_real, band_top,   'top',    corner_exclude_x_px, corner_exclude_y_px,(x0,y0,bw,bh))
+    pts_bottom= _extract_edge_points(mask_real, band_bottom,'bottom', corner_exclude_x_px, corner_exclude_y_px,(x0,y0,bw,bh))
+    pts_side = _extract_edge_points(mask_real, band_right, 'right', corner_exclude_x_px, corner_exclude_y_px,(x0,y0,bw,bh))
+    if min(pts_top.shape[0], pts_side.shape[0], pts_bottom.shape[0]) < 50:
+        raise RuntimeError("線抽出点が不足しています。band_* や exclude_*、trim比を見直してください。")
+
+    vx,vy,xz,yz=_fit_line_L2(pts_top)
+    a_top,b_top,c_top=_line_params_abc(vx,vy,xz,yz)
+    top_angle_deg=_line_angle_deg(vx,vy)
+    top_slope=vy/vx if abs(vx)>1e-9 else float("inf")
+    vx,vy,xz,yz=_fit_line_L2(pts_side)
+    a_side,b_side,c_side=_line_params_abc(vx,vy,xz,yz)
+    side_angle_deg=_line_angle_deg(vx,vy)
+    side_slope=vy/vx if abs(vx)>1e-9 else float("inf")
+    vx,vy,xz,yz=_fit_line_L2(pts_bottom)
+    a_bottom,b_bottom,c_bottom=_line_params_abc(vx,vy,xz,yz)
+    bottom_angle_deg=_line_angle_deg(vx,vy)
+    bottom_slope=vy/vx if abs(vx)>1e-9 else float("inf")
+
+    trim_x_px=rx*bw; trim_y_px=ry*bh
+    quad_up=_make_corner_quad_from_lines((a_top,b_top,c_top),(a_side,b_side,c_side), trim_x_px,trim_y_px,img.shape)
+    quad_down=_make_corner_rd((a_side,b_side,c_side),(a_bottom,b_bottom,c_bottom), trim_x_px,trim_y_px,img.shape)
+
+    mask_rect=np.zeros_like(bin_inv)
+    if quad_up.shape[0]>=3: cv2.fillPoly(mask_rect,[quad_up.astype(np.int32)],255)
+    if quad_down.shape[0]>=3: cv2.fillPoly(mask_rect,[quad_down.astype(np.int32)],255)
+    mask_diff=cv2.subtract(mask_rect, mask_real)
+
+    def _area_quad(mask, quad):
+        if quad.shape[0]<3: return 0, np.zeros_like(mask)
+        roi=np.zeros_like(mask); cv2.fillPoly(roi,[quad.astype(np.int32)],255)
+        area=int(np.sum(cv2.bitwise_and(mask,roi)>128))
+        return area, roi
+
+    ru_area, ru_mask = _area_quad(mask_diff, quad_up)
+    rd_area, rd_mask = _area_quad(mask_diff, quad_down)
+    ru_result = "NOTCH" if ru_area>diff_thresh else "NO NOTCH"
+    rd_result = "NOTCH" if rd_area>diff_thresh else "NO NOTCH"
+
+    vis=img.copy()
+    def _draw_line(img,a,b,c,color):
+        hh,ww=img.shape[:2]; pts=[]
+        if abs(b)>1e-9:
+            for X in (0,ww-1):
+                Y=int(round(-(a*X+c)/b)); pts.append((X,Y))
+        if abs(a)>1e-9:
+            for Y in (0,hh-1):
+                X=int(round(-(b*Y+c)/a)); pts.append((X,Y))
+        pts_in=[p for p in pts if 0<=p[0]<ww and 0<=p[1]<hh]
+        if len(pts_in)>=2: cv2.line(img, pts_in[0], pts_in[1], color, 2, cv2.LINE_AA)
+
+    hh, ww = img.shape[:2]
+    top_p1, top_p2 = _line_endpoints(a_top, b_top, c_top, ww, hh)
+    side_p1, side_p2 = _line_endpoints(a_side, b_side, c_side, ww, hh)
+    bottom_p1, bottom_p2 = _line_endpoints(a_bottom, b_bottom, c_bottom, ww, hh)
+
+    _draw_line(vis, a_top,b_top,c_top,         (0,255,0))
+    _draw_line(vis, a_side,b_side,c_side,      (255,0,255))
+    _draw_line(vis, a_bottom,b_bottom,c_bottom,(0,255,255))
+
+    vis_mask=vis.copy()
+    vis_mask[mask_diff>128]=[0,255,255]
+    if quad_up.shape[0]>=3: cv2.polylines(vis_mask,[quad_up.astype(np.int32)],True,(0,0,255),3)
+    if quad_down.shape[0]>=3: cv2.polylines(vis_mask,[quad_down.astype(np.int32)],True,(255,0,0),3)
+
+    if quad_up.shape[0]>=3:
+        P=np.mean(quad_up, axis=0).astype(int)
+        cv2.putText(vis_mask, f"RU: {ru_result} ({ru_area})",(P[0]+5,P[1]+5),cv2.FONT_HERSHEY_SIMPLEX,1.1,(0,0,255),3)
+    if quad_down.shape[0]>=3:
+        P=np.mean(quad_down, axis=0).astype(int)
+        cv2.putText(vis_mask, f"RD: {rd_result} ({rd_area})",(P[0]+5,P[1]+5),cv2.FONT_HERSHEY_SIMPLEX,1.1,(255,0,0),3)
+
+    if flip_horizontal:
+        cv2.putText(vis_mask, "FLIP: ON", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 3, cv2.LINE_AA)
+        cv2.putText(vis_mask, "FLIP: ON", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (30,30,30), 1, cv2.LINE_AA)
+
+    side_label = "Side"
+    return {
+        "img_bgr": vis_mask,
+        "ru_area": ru_area, "rd_area": rd_area,
+        "ru_result": ru_result, "rd_result": rd_result,
+        "mask_diff": mask_diff, "ru_roi_mask": ru_mask, "rd_roi_mask": rd_mask,
+        "top_angle_deg": top_angle_deg, "side_angle_deg": side_angle_deg,
+        "bottom_angle_deg": bottom_angle_deg, "top_slope": top_slope,
+        "side_slope": side_slope, "bottom_slope": bottom_slope,
+        "side_label": side_label,
+        "top_line": (top_p1, top_p2),
+        "side_line": (side_p1, side_p2),
+        "bottom_line": (bottom_p1, bottom_p2)
+    }
+
+
+# ================== デバイス薄ラッパ ==================
+
+class BaslerCamera:
+    def __init__(self, device_index=0, timeout_ms=3000, idle_reopen_sec=900, use_sw_trigger=True):
+        self.device_index=device_index
+        self.timeout_ms=timeout_ms
+        self.idle_reopen_sec=max(0, int(idle_reopen_sec))
+        self.use_sw_trigger=bool(use_sw_trigger)
+        self.cam=None; self.converter=None
+        self.last_snap_monotonic=0.0
+
+    def open(self):
+        if not HAS_PYLYON: raise RuntimeError("pypylon 未導入")
+        tlf=pylon.TlFactory.GetInstance()
+        devs=tlf.EnumerateDevices()
+        if not devs: raise RuntimeError("Basler カメラが見つかりません")
+        idx=min(max(0,self.device_index), len(devs)-1)
+        self.cam=pylon.InstantCamera(tlf.CreateDevice(devs[idx]))
+        self.cam.Open()
+        self.converter=pylon.ImageFormatConverter()
+        self.converter.OutputPixelFormat=pylon.PixelType_BGR8packed
+        self.converter.OutputBitAlignment=pylon.OutputBitAlignment_MsbAligned
+        try:
+            self.cam.ExposureAuto.SetValue("Off")
+            self.cam.GainAuto.SetValue("Off")
+        except Exception:
+            pass
+        self._configure_trigger_mode()
+        self._start_grabbing_if_needed()
+
+    def _configure_trigger_mode(self):
+        try:
+            self.cam.TriggerSelector.SetValue("FrameStart")
+            if self.use_sw_trigger:
+                self.cam.TriggerMode.SetValue("On")
+                self.cam.TriggerSource.SetValue("Software")
+            else:
+                self.cam.TriggerMode.SetValue("Off")
+        except Exception as e:
+            LOGGER.warning("Failed to configure trigger mode (sw=%s): %s", self.use_sw_trigger, e)
+
+    def _start_grabbing_if_needed(self):
+        if self.cam and (not self.cam.IsGrabbing()):
+            self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+
+    def is_open(self):
+        return bool(self.cam and self.cam.IsOpen())
+
+    def is_healthy(self):
+        return self.is_open()
+
+    def reopen(self):
+        self.close()
+        self.open()
+
+    def close(self):
+        try:
+            if self.cam:
+                if self.cam.IsGrabbing(): self.cam.StopGrabbing()
+                if self.cam.IsOpen(): self.cam.Close()
+        except Exception:
+            pass
+        self.cam=None
+        self.converter=None
+
+    def _reopen_if_idle(self):
+        if self.idle_reopen_sec <= 0:
+            return
+        now=time.monotonic()
+        if self.last_snap_monotonic > 0 and (now - self.last_snap_monotonic) >= float(self.idle_reopen_sec):
+            LOGGER.info("Camera idle for %.1fs, reopen before next snap", (now - self.last_snap_monotonic))
+            self.reopen()
+
+    def snap_bgr(self):
+        self._reopen_if_idle()
+        last_err=None
+        for attempt in range(2):
+            if not self.is_open():
+                self.open()
+            self._start_grabbing_if_needed()
+            res=None
+            try:
+                if self.use_sw_trigger:
+                    try:
+                        self.cam.TriggerSoftware.Execute()
+                    except Exception as e:
+                        raise RuntimeError(f"ソフトウェアトリガ実行に失敗: {e}")
+                res=self.cam.RetrieveResult(self.timeout_ms, pylon.TimeoutHandling_Return)
+                if res is None or not res.GrabSucceeded():
+                    raise RuntimeError("画像取得に失敗")
+                image=self.converter.Convert(res)
+                img=image.GetArray()
+                self.last_snap_monotonic=time.monotonic()
+                return img
+            except Exception as e:
+                last_err=e
+                LOGGER.warning("Camera snap attempt %d failed: %s", attempt + 1, e)
+                if attempt == 0:
+                    try:
+                        self.reopen()
+                    except Exception as re:
+                        LOGGER.warning("Camera reopen after snap failure failed: %s", re)
+                        self.cam=None
+                else:
+                    break
+            finally:
+                try:
+                    if res is not None:
+                        res.Release()
+                except Exception:
+                    pass
+        msg = str(last_err) if last_err is not None else "画像取得に失敗"
+        if msg.startswith("画像取得に失敗"):
+            raise RuntimeError(msg)
+        raise RuntimeError(f"画像取得に失敗: {msg}")
+
+    def __del__(self):
+        self.close()
+
+class PLCClient:
+    def __init__(self):
+        self.cli=None
+
+    @staticmethod
+    def _coerce_numeric(value):
+        if isinstance(value, bool):
+            return 1 if value else 0
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        if isinstance(value, (float, np.floating)):
+            return int(value)
+        text = str(value).strip()
+        if not text:
+            raise ValueError("empty PLC value")
+        return int(float(text))
+
+    @staticmethod
+    def _parse_d_bit_device(device: str):
+        text = (device or "").strip()
+        m = re.fullmatch(r'([Dd]\d+)\.(\d+)', text)
+        if not m:
+            return None
+        word_dev = m.group(1).upper()
+        bit_index = int(m.group(2))
+        if not (0 <= bit_index <= 15):
+            raise ValueError(f"Dデバイスのビット番号は0..15で指定してください: {device}")
+        return word_dev, bit_index
+
+    def connect(self, host:str, port:int):
+        if not HAS_PYMC: raise RuntimeError("pymcprotocol 未導入")
+        self.cli=pymcprotocol.Type3E(plctype="Q")
+        self.cli.connect(host, port)
+
+    def close(self):
+        try:
+            if self.cli: self.cli.close()
+        except Exception:
+            pass
+        self.cli=None
+
+    def read_bit(self, head:str)->bool:
+        d_bit = self._parse_d_bit_device(head)
+        if d_bit is not None:
+            word_dev, bit_index = d_bit
+            vals=self.cli.batchread_wordunits(headdevice=word_dev, readsize=1)
+            raw = vals[0] if isinstance(vals,(list,tuple)) else vals
+            w = self._coerce_numeric(raw) & 0xFFFF
+            return bool((w >> bit_index) & 0x1)
+        vals=self.cli.batchread_bitunits(headdevice=head, readsize=1)
+        raw = vals[0] if isinstance(vals,(list,tuple)) else vals
+        v=self._coerce_numeric(raw)
+        return bool(v)
+
+    def write_bit(self, head:str, value:bool):
+        d_bit = self._parse_d_bit_device(head)
+        if d_bit is not None:
+            word_dev, bit_index = d_bit
+            vals=self.cli.batchread_wordunits(headdevice=word_dev, readsize=1)
+            raw = vals[0] if isinstance(vals,(list,tuple)) else vals
+            w = self._coerce_numeric(raw) & 0xFFFF
+            mask = 1 << bit_index
+            w2 = (w | mask) if bool(value) else (w & (~mask & 0xFFFF))
+            self.cli.batchwrite_wordunits(headdevice=word_dev, values=[w2])
+            return
+        self.cli.batchwrite_bitunits(headdevice=head, values=[1 if value else 0])
+
+    def pulse_bit(self, head:str, ms:int=50):
+        self.write_bit(head, True)
+        time.sleep(max(0,ms)/1000.0)
+        self.write_bit(head, False)
+
+    def read_word(self, head:str)->int:
+        vals=self.cli.batchread_wordunits(headdevice=head, readsize=1)
+        raw = vals[0] if isinstance(vals,(list,tuple)) else vals
+        v=self._coerce_numeric(raw)
+        return v & 0xFFFF
+
+    def write_word(self, head:str, value:int):
+        self.cli.batchwrite_wordunits(headdevice=head, values=[int(value)&0xFFFF])
 
 
 CONFIG_PATH_4CAM = os.path.join(os.path.expanduser("~"), ".notch_app_4cam_config.json")
