@@ -114,7 +114,7 @@ def list_basler_devices():
 def _fit_line_L2(points_xy):
     pts = points_xy.astype(np.float32).reshape(-1,1,2)
     vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
-    return float(vx), float(vy), float(x0), float(y0)
+    return float(vx.ravel()[0]), float(vy.ravel()[0]), float(x0.ravel()[0]), float(y0.ravel()[0])
 
 # 解説: 直線の方向表現を ax+by+c=0 形式へ正規化変換します。
 def _line_params_abc(vx, vy, x0, y0):
