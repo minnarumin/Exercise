@@ -39,6 +39,7 @@ from dataclasses import dataclass, asdict, field
 import tkinter as tk
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
+from PIL import Image, ImageTk
 
 def imread_unicode(filename):
     data = np.fromfile(filename, dtype=np.uint8)
@@ -581,6 +582,9 @@ class NotchApp4Cam(ttk.Window):
 
         self.cameras = [None, None, None, None]
         self._cam_locks = [threading.RLock() for _ in range(4)]
+        self.cam_panels = []
+        self.cam_grab_stop = [threading.Event() for _ in range(4)]
+        self.cam_grab_threads = [None, None, None, None]
 
         self.var_plc_ip = tk.StringVar(value=self.cfg.plc_ip)
         self.var_plc_port = tk.IntVar(value=self.cfg.plc_port)
@@ -672,12 +676,12 @@ class NotchApp4Cam(ttk.Window):
         for i, v in enumerate(self.cam_vars, start=1):
             frm = ttk.Frame(nb, padding=8)
             nb.add(frm, text=f"Cam{i}")
-            self._build_cam_tab(frm, v)
+            self._build_cam_tab(frm, v, i - 1)
 
         self.txt_status = tk.Text(root, height=8, wrap="word", state="disabled")
         self.txt_status.pack(fill="x", pady=(6, 0))
 
-    def _build_cam_tab(self, parent, v):
+    def _build_cam_tab(self, parent, v, cam_idx):
         r1 = ttk.Frame(parent); r1.pack(fill="x", pady=2)
         ttk.Label(r1, text="カメラインデックス").pack(side="left")
         ttk.Entry(r1, textvariable=v["camera_index"], width=6).pack(side="left", padx=4)
@@ -707,6 +711,121 @@ class NotchApp4Cam(ttk.Window):
         ttk.Entry(r4, textvariable=v["dev_err_an"], width=10).pack(side="left", padx=4)
         ttk.Label(r4, text="CSV").pack(side="left")
         ttk.Entry(r4, textvariable=v["csv_filename"], width=24).pack(side="left", padx=4)
+
+        r5 = ttk.Frame(parent); r5.pack(fill="x", pady=(6, 4))
+        ttk.Button(r5, text="撮像", bootstyle=PRIMARY, command=lambda i=cam_idx: self.on_cam_snap(i)).pack(side="left")
+        ttk.Button(r5, text="連続Grab開始", bootstyle=SUCCESS, command=lambda i=cam_idx: self.on_cam_grab_start(i)).pack(side="left", padx=4)
+        ttk.Button(r5, text="連続Grab停止", bootstyle=WARNING, command=lambda i=cam_idx: self.on_cam_grab_stop(i)).pack(side="left")
+
+        preview = ttk.Labelframe(parent, text="プレビュー", padding=6)
+        preview.pack(fill="both", expand=True, pady=(4, 0))
+        canvas = tk.Canvas(preview, width=420, height=260, bg="#111111", highlightthickness=1, highlightbackground="#444444")
+        canvas.pack(fill="both", expand=True)
+        result_var = tk.StringVar(value="未撮像")
+        ttk.Label(preview, textvariable=result_var, justify="left", anchor="w").pack(fill="x", pady=(4, 0))
+
+        self.cam_panels.append({"canvas": canvas, "result_var": result_var, "photo": None})
+
+    def _analyze_bgr_for_cam(self, cam_idx, bgr):
+        tmp_dir = self.cfg.plc_shot_dir or tempfile.gettempdir()
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_path = os.path.join(tmp_dir, f"_preview_cam{cam_idx+1}_{time.time_ns()}.png")
+        ok, buf = cv2.imencode('.png', bgr)
+        if not ok:
+            raise RuntimeError("画像エンコード失敗")
+        buf.tofile(tmp_path)
+        try:
+            c = self.cfg.cams[cam_idx]
+            return analyze_image(
+                tmp_path,
+                trim_ratio_x=c.trim_ratio_x,
+                trim_ratio_y=c.trim_ratio_y,
+                diff_thresh=c.diff_thresh,
+                flip_horizontal=c.flip_horizontal,
+                band_top=c.band_top,
+                band_right=c.band_right,
+                band_bottom=c.band_bottom,
+                corner_exclude_x_px=c.corner_exclude_x_px,
+                corner_exclude_y_px=c.corner_exclude_y_px,
+            )
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    def _post_cam_preview(self, cam_idx, img_bgr, result_text):
+        def _update():
+            if cam_idx >= len(self.cam_panels):
+                return
+            panel = self.cam_panels[cam_idx]
+            canvas = panel["canvas"]
+            cw = max(int(canvas.winfo_width()), 10)
+            ch = max(int(canvas.winfo_height()), 10)
+            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            scale = min(cw / max(w, 1), ch / max(h, 1))
+            nw = max(1, int(w * scale))
+            nh = max(1, int(h * scale))
+            pil = Image.fromarray(rgb).resize((nw, nh), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(pil)
+            canvas.delete("all")
+            canvas.create_image(cw // 2, ch // 2, image=photo, anchor="center")
+            panel["photo"] = photo
+            panel["result_var"].set(result_text)
+
+        self.after(0, _update)
+
+    def _run_cam_snap_and_preview(self, cam_idx):
+        bgr = self._cam_snap(cam_idx)
+        try:
+            res = self._analyze_bgr_for_cam(cam_idx, bgr)
+            txt = (
+                f"RU={res['ru_result']}({res['ru_area']}) / "
+                f"RD={res['rd_result']}({res['rd_area']}) / "
+                f"角度 Top={res['top_angle_deg']:.2f} Side={res['side_angle_deg']:.2f} Bottom={res['bottom_angle_deg']:.2f}"
+            )
+            self._post_cam_preview(cam_idx, res["img_bgr"], txt)
+        except Exception as e:
+            self._post_cam_preview(cam_idx, bgr, f"解析エラー: {e}")
+            raise
+
+    def on_cam_snap(self, cam_idx):
+        try:
+            self._sync_cfg()
+            self._run_cam_snap_and_preview(cam_idx)
+            self._post_status(f"Cam{cam_idx+1} 手動撮像完了")
+        except Exception as e:
+            self._post_status(f"Cam{cam_idx+1} 手動撮像エラー: {e}")
+
+    def _cam_grab_loop(self, cam_idx):
+        stop_event = self.cam_grab_stop[cam_idx]
+        while not stop_event.is_set():
+            try:
+                self._run_cam_snap_and_preview(cam_idx)
+            except Exception as e:
+                self._post_status(f"Cam{cam_idx+1} 連続Grabエラー: {e}")
+            stop_event.wait(0.2)
+
+    def on_cam_grab_start(self, cam_idx):
+        self._sync_cfg()
+        t = self.cam_grab_threads[cam_idx]
+        if t and t.is_alive():
+            self._post_status(f"Cam{cam_idx+1} は既に連続Grab中")
+            return
+        self.cam_grab_stop[cam_idx].clear()
+        th = threading.Thread(target=self._cam_grab_loop, args=(cam_idx,), daemon=True)
+        self.cam_grab_threads[cam_idx] = th
+        th.start()
+        self._post_status(f"Cam{cam_idx+1} 連続Grab開始")
+
+    def on_cam_grab_stop(self, cam_idx):
+        self.cam_grab_stop[cam_idx].set()
+        t = self.cam_grab_threads[cam_idx]
+        if t and t.is_alive():
+            t.join(timeout=1.0)
+        self.cam_grab_threads[cam_idx] = None
+        self._post_status(f"Cam{cam_idx+1} 連続Grab停止")
 
     def _bind_traces(self):
         def on_change(*_):
@@ -929,9 +1048,21 @@ class NotchApp4Cam(ttk.Window):
                     rd = (res["rd_result"] == "NOTCH")
                     ru_area = int(res["ru_area"])
                     rd_area = int(res["rd_area"])
+                    preview_txt = (
+                        f"RU={res['ru_result']}({res['ru_area']}) / "
+                        f"RD={res['rd_result']}({res['rd_area']}) / "
+                        f"角度 Top={res['top_angle_deg']:.2f} Side={res['side_angle_deg']:.2f} Bottom={res['bottom_angle_deg']:.2f}"
+                    )
+                    self._post_cam_preview(i, res["img_bgr"], preview_txt)
                 except Exception as e:
                     an_error = True
                     err_msg = f"ANALYZE:{e}"
+                    try:
+                        raw = imread_unicode(shot_path) if shot_path else None
+                        if raw is not None:
+                            self._post_cam_preview(i, raw, f"解析エラー: {e}")
+                    except Exception:
+                        pass
                     self._post_status(f"Cam{i+1} 解析エラー: {e}")
             else:
                 to_error = True
@@ -971,6 +1102,8 @@ class NotchApp4Cam(ttk.Window):
         try:
             self.on_watch_stop()
             self.on_plc_disconnect()
+            for i in range(4):
+                self.on_cam_grab_stop(i)
             for i in range(4):
                 try:
                     if self.cameras[i]:
