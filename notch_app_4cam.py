@@ -610,7 +610,6 @@ class NotchApp4Cam(ttk.Window):
         self.cam_panels = []
         self.cam_grab_stop = [threading.Event() for _ in range(4)]
         self.cam_grab_threads = [None, None, None, None]
-        self.cam_device_combos = []
         self.cam_select_vars = []
         self.camera_candidates = []
         self.camera_label_to_index = {}
@@ -700,6 +699,7 @@ class NotchApp4Cam(ttk.Window):
         menubar.add_cascade(label="設定", menu=menu_setting)
 
         menu_cam = tk.Menu(menubar, tearoff=0)
+        menu_cam.add_command(label="カメラ別設定...", command=self._open_camera_settings)
         menu_cam.add_command(label="接続カメラ再検出", command=self._refresh_camera_candidates)
         menubar.add_cascade(label="カメラ", menu=menu_cam)
 
@@ -749,6 +749,53 @@ class NotchApp4Cam(ttk.Window):
         r5 = ttk.Frame(frm); r5.pack(fill="x", pady=(10, 0))
         ttk.Button(r5, text="保存して閉じる", bootstyle=PRIMARY, command=lambda: (self._sync_cfg(), self.cfg.save(), win.destroy())).pack(side="right")
 
+    def _open_camera_settings(self):
+        self._refresh_camera_candidates()
+        win = tk.Toplevel(self)
+        win.title("カメラ別設定")
+        win.geometry("920x420")
+        win.transient(self)
+
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        nb = ttk.Notebook(frm)
+        nb.pack(fill="both", expand=True)
+
+        labels = [label for _, label in self.camera_candidates]
+        for i in range(4):
+            tab = ttk.Frame(nb, padding=8)
+            nb.add(tab, text=f"Cam{i+1}")
+
+            r1 = ttk.Frame(tab); r1.pack(fill="x", pady=2)
+            ttk.Label(r1, text="カメラ選択").pack(side="left")
+            cmb = ttk.Combobox(r1, textvariable=self.cam_select_vars[i], state="readonly", width=36, values=labels)
+            cmb.pack(side="left", padx=4)
+            cmb.bind("<<ComboboxSelected>>", lambda _e, x=i: self._on_cam_device_selected(x))
+
+            v = self.cam_vars[i]
+            r2 = ttk.Frame(tab); r2.pack(fill="x", pady=2)
+            ttk.Label(r2, text="結果RU").pack(side="left")
+            ttk.Entry(r2, textvariable=v["dev_ru"], width=10).pack(side="left", padx=4)
+            ttk.Label(r2, text="結果RD").pack(side="left")
+            ttk.Entry(r2, textvariable=v["dev_rd"], width=10).pack(side="left", padx=4)
+            ttk.Label(r2, text="DONE").pack(side="left")
+            ttk.Entry(r2, textvariable=v["dev_done"], width=10).pack(side="left", padx=4)
+
+            r3 = ttk.Frame(tab); r3.pack(fill="x", pady=2)
+            ttk.Label(r3, text="ERR_TO").pack(side="left")
+            ttk.Entry(r3, textvariable=v["dev_err_to"], width=10).pack(side="left", padx=4)
+            ttk.Label(r3, text="ERR_AN").pack(side="left")
+            ttk.Entry(r3, textvariable=v["dev_err_an"], width=10).pack(side="left", padx=4)
+            ttk.Label(r3, text="CSV").pack(side="left")
+            ttk.Entry(r3, textvariable=v["csv_filename"], width=28).pack(side="left", padx=4)
+
+        rbtn = ttk.Frame(frm)
+        rbtn.pack(fill="x", pady=(8, 0))
+        ttk.Button(rbtn, text="再検出", command=self._refresh_camera_candidates).pack(side="left")
+        ttk.Button(rbtn, text="保存して閉じる", bootstyle=PRIMARY,
+                   command=lambda: (self._sync_cfg(), self.cfg.save(), win.destroy())).pack(side="right")
+
     def _refresh_camera_candidates(self):
         cands = list_basler_devices()
         if not cands:
@@ -761,9 +808,6 @@ class NotchApp4Cam(ttk.Window):
         labels = [label for _, label in cands]
 
         for i in range(min(4, len(self.cam_select_vars))):
-            combo = self.cam_device_combos[i] if i < len(self.cam_device_combos) else None
-            if combo is not None:
-                combo.configure(values=labels)
             idx = int(self.cam_vars[i]["camera_index"].get())
             match = next((lab for n, lab in cands if n == idx), None)
             if match is None:
@@ -780,11 +824,6 @@ class NotchApp4Cam(ttk.Window):
 
     def _build_cam_tab(self, parent, v, cam_idx):
         r1 = ttk.Frame(parent); r1.pack(fill="x", pady=2)
-        ttk.Label(r1, text="カメラ選択").pack(side="left")
-        combo = ttk.Combobox(r1, textvariable=self.cam_select_vars[cam_idx], state="readonly", width=36)
-        combo.pack(side="left", padx=4)
-        combo.bind("<<ComboboxSelected>>", lambda _e, i=cam_idx: self._on_cam_device_selected(i))
-        self.cam_device_combos.append(combo)
         ttk.Checkbutton(r1, text="左右反転", variable=v["flip_horizontal"]).pack(side="left", padx=10)
 
         r2 = ttk.Frame(parent); r2.pack(fill="x", pady=2)
@@ -795,22 +834,6 @@ class NotchApp4Cam(ttk.Window):
         ]:
             ttk.Label(r2, text=label).pack(side="left")
             ttk.Entry(r2, textvariable=v[key], width=w).pack(side="left", padx=2)
-
-        r3 = ttk.Frame(parent); r3.pack(fill="x", pady=2)
-        ttk.Label(r3, text="結果RU").pack(side="left")
-        ttk.Entry(r3, textvariable=v["dev_ru"], width=10).pack(side="left", padx=4)
-        ttk.Label(r3, text="結果RD").pack(side="left")
-        ttk.Entry(r3, textvariable=v["dev_rd"], width=10).pack(side="left", padx=4)
-        ttk.Label(r3, text="DONE").pack(side="left")
-        ttk.Entry(r3, textvariable=v["dev_done"], width=10).pack(side="left", padx=4)
-
-        r4 = ttk.Frame(parent); r4.pack(fill="x", pady=2)
-        ttk.Label(r4, text="ERR_TO").pack(side="left")
-        ttk.Entry(r4, textvariable=v["dev_err_to"], width=10).pack(side="left", padx=4)
-        ttk.Label(r4, text="ERR_AN").pack(side="left")
-        ttk.Entry(r4, textvariable=v["dev_err_an"], width=10).pack(side="left", padx=4)
-        ttk.Label(r4, text="CSV").pack(side="left")
-        ttk.Entry(r4, textvariable=v["csv_filename"], width=24).pack(side="left", padx=4)
 
         r5 = ttk.Frame(parent); r5.pack(fill="x", pady=(6, 4))
         ttk.Button(r5, text="撮像", bootstyle=PRIMARY, command=lambda i=cam_idx: self.on_cam_snap(i)).pack(side="left")
