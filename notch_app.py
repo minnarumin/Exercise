@@ -400,10 +400,11 @@ def analyze_image(
 
 # ================== デバイス薄ラッパ ==================
 class BaslerCamera:
-    def __init__(self, device_index=0, timeout_ms=3000, idle_reopen_sec=900):
+    def __init__(self, device_index=0, timeout_ms=3000, idle_reopen_sec=900, use_sw_trigger=True):
         self.device_index=device_index
         self.timeout_ms=timeout_ms
         self.idle_reopen_sec=max(0, int(idle_reopen_sec))
+        self.use_sw_trigger=bool(use_sw_trigger)
         self.cam=None; self.converter=None
         self.last_snap_monotonic=0.0
 
@@ -421,12 +422,21 @@ class BaslerCamera:
         try:
             self.cam.ExposureAuto.SetValue("Off")
             self.cam.GainAuto.SetValue("Off")
-            self.cam.TriggerSelector.SetValue("FrameStart")
-            self.cam.TriggerMode.SetValue("On")
-            self.cam.TriggerSource.SetValue("Software")
         except Exception:
             pass
+        self._configure_trigger_mode()
         self._start_grabbing_if_needed()
+
+    def _configure_trigger_mode(self):
+        try:
+            self.cam.TriggerSelector.SetValue("FrameStart")
+            if self.use_sw_trigger:
+                self.cam.TriggerMode.SetValue("On")
+                self.cam.TriggerSource.SetValue("Software")
+            else:
+                self.cam.TriggerMode.SetValue("Off")
+        except Exception as e:
+            LOGGER.warning("Failed to configure trigger mode (sw=%s): %s", self.use_sw_trigger, e)
 
     def _start_grabbing_if_needed(self):
         if self.cam and (not self.cam.IsGrabbing()):
@@ -469,10 +479,11 @@ class BaslerCamera:
             self._start_grabbing_if_needed()
             res=None
             try:
-                try:
-                    self.cam.TriggerSoftware.Execute()
-                except Exception:
-                    pass
+                if self.use_sw_trigger:
+                    try:
+                        self.cam.TriggerSoftware.Execute()
+                    except Exception as e:
+                        raise RuntimeError(f"ソフトウェアトリガ実行に失敗: {e}")
                 res=self.cam.RetrieveResult(self.timeout_ms, pylon.TimeoutHandling_Return)
                 if res is None or not res.GrabSucceeded():
                     raise RuntimeError("画像取得に失敗")
@@ -497,7 +508,10 @@ class BaslerCamera:
                         res.Release()
                 except Exception:
                     pass
-        raise RuntimeError(f"画像取得に失敗: {last_err}")
+        msg = str(last_err) if last_err is not None else "画像取得に失敗"
+        if msg.startswith("画像取得に失敗"):
+            raise RuntimeError(msg)
+        raise RuntimeError(f"画像取得に失敗: {msg}")
 
     def __del__(self):
         self.close()
@@ -1387,11 +1401,13 @@ class NotchApp(ttk.Window):
         with self._cam_lock:
             desired_idx = int(self.var_camera_index.get())
             desired_timeout = int(self.var_timeout_ms.get())
+            desired_sw_trig = bool(self.var_use_sw_trig.get())
             if self.basler is None:
                 self.basler = BaslerCamera(
                     device_index=desired_idx,
                     timeout_ms=desired_timeout,
-                    idle_reopen_sec=self.cam_idle_reopen_sec
+                    idle_reopen_sec=self.cam_idle_reopen_sec,
+                    use_sw_trigger=desired_sw_trig
                 )
                 self.basler.open()
             else:
@@ -1401,6 +1417,9 @@ class NotchApp(ttk.Window):
                     need_reopen=True
                 self.basler.timeout_ms = desired_timeout
                 self.basler.idle_reopen_sec = self.cam_idle_reopen_sec
+                if self.basler.use_sw_trigger != desired_sw_trig:
+                    self.basler.use_sw_trigger = desired_sw_trig
+                    need_reopen=True
                 if not self.basler.is_healthy():
                     need_reopen=True
                 if need_reopen:
