@@ -1268,6 +1268,8 @@ class NotchApp(ttk.Window):
             self._show_preview(path, res)
         except Exception as e:
             LOGGER.exception("Preview failed")
+            if 'path' in locals() and isinstance(path, str) and os.path.isfile(path):
+                self._show_raw_preview(path, reason=f"プレビュー解析失敗: {e}")
             self._post_status(f"[エラー:プレビュー] {e}")
 
     def on_batch_process(self):
@@ -1345,6 +1347,24 @@ class NotchApp(ttk.Window):
             pass
         self._post_status("解析結果を更新しました。")
         self.last_result=result_dict; self.last_result_path=path
+
+    def _show_raw_preview(self, path, reason="解析失敗のため生データ表示"):
+        try:
+            bgr = imread_unicode(path)
+            if bgr is None:
+                self._post_status(f"[警告] 生データ表示に失敗: {path}")
+                return
+            rgb=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            self.canvas.set_image(Image.fromarray(rgb))
+            self.zoom_label.config(text=f"{self.canvas.zoom*100:.0f}%")
+            line=f"{time.strftime('%H:%M:%S')} | {os.path.basename(path)} | RAW表示 | {reason}"
+            self._result_lines.appendleft(line)
+            self.txt_result.configure(state="normal")
+            self.txt_result.delete("1.0", "end")
+            self.txt_result.insert("1.0", "\n".join(list(self._result_lines)))
+            self.txt_result.configure(state="disabled")
+        except Exception:
+            LOGGER.exception("Failed to show raw preview: %s", path)
 
     # ---------- カメラ共通ヘルパ（スレッド安全） ----------
     def _cam_open_if_needed(self):
@@ -1674,6 +1694,8 @@ class NotchApp(ttk.Window):
             except Exception as e:
                 an_error=True
                 self._post_status(f"解析エラー: {e}")
+                if img_tmp_path and os.path.isfile(img_tmp_path):
+                    self._post_raw_preview(img_tmp_path, reason=f"PLC解析失敗: {e}")
                 t_csv = time.monotonic()
                 row=[os.path.basename(img_tmp_path) if img_tmp_path else "",
                      os.path.dirname(img_tmp_path) if img_tmp_path else "",
@@ -1864,6 +1886,12 @@ class NotchApp(ttk.Window):
     def _post_preview(self, path, resdict):
         try:
             self.after(0, lambda: self._show_preview(path, resdict))
+        except Exception:
+            pass
+
+    def _post_raw_preview(self, path, reason="解析失敗のため生データ表示"):
+        try:
+            self.after(0, lambda p=path, r=reason: self._show_raw_preview(p, r))
         except Exception:
             pass
 
