@@ -439,10 +439,11 @@ def analyze_image(
 # 解説: BaslerCamera クラスを定義します。
 class BaslerCamera:
     # 解説: __init__ の処理を定義します。
-    def __init__(self, device_index=0, timeout_ms=3000, idle_reopen_sec=900):
+    def __init__(self, device_index=0, timeout_ms=3000, idle_reopen_sec=900, use_sw_trigger=True):
         self.device_index=device_index
         self.timeout_ms=timeout_ms
         self.idle_reopen_sec=max(0, int(idle_reopen_sec))
+        self.use_sw_trigger=bool(use_sw_trigger)
         self.cam=None; self.converter=None
         self.last_snap_monotonic=0.0
 
@@ -461,12 +462,22 @@ class BaslerCamera:
         try:
             self.cam.ExposureAuto.SetValue("Off")
             self.cam.GainAuto.SetValue("Off")
-            self.cam.TriggerSelector.SetValue("FrameStart")
-            self.cam.TriggerMode.SetValue("On")
-            self.cam.TriggerSource.SetValue("Software")
         except Exception:
             pass
+        self._configure_trigger_mode()
         self._start_grabbing_if_needed()
+
+    # 解説: _configure_trigger_mode の処理を定義します。
+    def _configure_trigger_mode(self):
+        try:
+            self.cam.TriggerSelector.SetValue("FrameStart")
+            if self.use_sw_trigger:
+                self.cam.TriggerMode.SetValue("On")
+                self.cam.TriggerSource.SetValue("Software")
+            else:
+                self.cam.TriggerMode.SetValue("Off")
+        except Exception as e:
+            LOGGER.warning("Failed to configure trigger mode (sw=%s): %s", self.use_sw_trigger, e)
 
     # 解説: _start_grabbing_if_needed の処理を定義します。
     def _start_grabbing_if_needed(self):
@@ -516,10 +527,11 @@ class BaslerCamera:
             self._start_grabbing_if_needed()
             res=None
             try:
-                try:
-                    self.cam.TriggerSoftware.Execute()
-                except Exception:
-                    pass
+                if self.use_sw_trigger:
+                    try:
+                        self.cam.TriggerSoftware.Execute()
+                    except Exception as e:
+                        raise RuntimeError(f"ソフトウェアトリガ実行に失敗: {e}")
                 res=self.cam.RetrieveResult(self.timeout_ms, pylon.TimeoutHandling_Return)
                 if res is None or not res.GrabSucceeded():
                     raise RuntimeError("画像取得に失敗")
@@ -544,7 +556,10 @@ class BaslerCamera:
                         res.Release()
                 except Exception:
                     pass
-        raise RuntimeError(f"画像取得に失敗: {last_err}")
+        msg = str(last_err) if last_err is not None else "画像取得に失敗"
+        if msg.startswith("画像取得に失敗"):
+            raise RuntimeError(msg)
+        raise RuntimeError(f"画像取得に失敗: {msg}")
 
     # 解説: __del__ の処理を定義します。
     def __del__(self):
@@ -911,10 +926,15 @@ class NotchApp(ttk.Window):
 
         # 一時ファイル管理
         self.temp_max_files=tk.IntVar(value=self.cfg.temp_max_files)
+        self.var_temp_prefixes=tk.StringVar(value=", ".join(self.cfg.temp_prefixes))
 
         # CSV関連
         self.csv_max_records=tk.IntVar(value=self.cfg.csv_max_records)
         self.var_plc_shot_dir=tk.StringVar(value=self.cfg.plc_shot_dir)
+
+        # 自動再接続/監視
+        self.var_auto_reconnect=tk.BooleanVar(value=self.cfg.auto_reconnect)
+        self.var_auto_watch_on_ready=tk.BooleanVar(value=self.cfg.auto_watch_on_ready)
 
         # 連続Grab状態
         self.video_running=False
@@ -1125,6 +1145,10 @@ class NotchApp(ttk.Window):
         ttk.Label(r3, text="完了パルス幅[ms]").pack(side="left", padx=(12,2))
         ttk.Entry(r3, textvariable=self.var_done_ms, width=8).pack(side="left")
 
+        sec4=ttk.Labelframe(frm, text="自動復旧", padding=8); sec4.pack(fill="x", pady=6)
+        ttk.Checkbutton(sec4, text="通信断時にPLC自動再接続", variable=self.var_auto_reconnect).pack(anchor="w")
+        ttk.Checkbutton(sec4, text="PLC+カメラ準備完了で監視自動開始", variable=self.var_auto_watch_on_ready).pack(anchor="w", pady=(4,0))
+
         ttk.Label(frm, text="変更は即保存されます。閉じるときは右上×で閉じてください。", bootstyle=INFO).pack(anchor="w", pady=(8,0))
 
         # IP/Port 表示の同期
@@ -1173,8 +1197,11 @@ class NotchApp(ttk.Window):
         frm=ttk.Frame(win, padding=10); frm.pack(fill="both", expand=True)
         r=ttk.Frame(frm); r.pack(fill="x", pady=2)
         ttk.Label(r, text="保持上限(枚)").pack(side="left"); ttk.Entry(r, textvariable=self.temp_max_files, width=8).pack(side="left", padx=6)
+        r2=ttk.Frame(frm); r2.pack(fill="x", pady=4)
+        ttk.Label(r2, text="対象プレフィックス(カンマ区切り)").pack(side="left")
+        ttk.Entry(r2, textvariable=self.var_temp_prefixes, width=36).pack(side="left", padx=6)
         ttk.Button(frm, text="今すぐ清掃", command=self._auto_cleanup_temp_files).pack(anchor="w", pady=(8,2))
-        ttk.Label(frm, text="BaslerShot_*/PLCshot_* を古い順に削除します。", bootstyle=INFO).pack(anchor="w")
+        ttk.Label(frm, text="例: BaslerShot_, PLCshot_", bootstyle=INFO).pack(anchor="w")
 
     # 解説: _open_result_settings の処理を定義します。
     def _open_result_settings(self):
@@ -1220,8 +1247,8 @@ class NotchApp(ttk.Window):
             self.var_dev_done, self.var_dev_busy, self.var_dev_err_to, self.var_dev_err_an,
             self.var_use_sw_trig, self.var_timeout_ms, self.var_done_ms,
             self.var_dev_alive, self.var_alive_ms, self.var_alive_step, self.var_alive_auto,
-            self.temp_max_files, self.csv_max_records, self.var_plc_shot_dir,
-            self.var_camera_index
+            self.temp_max_files, self.var_temp_prefixes, self.csv_max_records, self.var_plc_shot_dir,
+            self.var_camera_index, self.var_auto_reconnect, self.var_auto_watch_on_ready
         )
 
         # 解説: bind_with_preview の処理を定義します。
@@ -1286,8 +1313,12 @@ class NotchApp(ttk.Window):
         self.cfg.alive_step=int(self.var_alive_step.get())
         self.cfg.alive_auto=bool(self.var_alive_auto.get())
         self.cfg.temp_max_files=int(self.temp_max_files.get())
+        prefixes=[x.strip() for x in self.var_temp_prefixes.get().split(",") if x.strip()]
+        self.cfg.temp_prefixes=prefixes if prefixes else ["BaslerShot_", "PLCshot_"]
         self.cfg.csv_max_records=int(self.csv_max_records.get())
         self.cfg.plc_shot_dir=self.var_plc_shot_dir.get().strip()
+        self.cfg.auto_reconnect=bool(self.var_auto_reconnect.get())
+        self.cfg.auto_watch_on_ready=bool(self.var_auto_watch_on_ready.get())
 
     # 解説: _next_shot_path の処理を定義します。
     def _next_shot_path(self, base_dir, prefix, ext=".png"):
@@ -1490,11 +1521,13 @@ class NotchApp(ttk.Window):
         with self._cam_lock:
             desired_idx = int(self.var_camera_index.get())
             desired_timeout = int(self.var_timeout_ms.get())
+            desired_sw_trig = bool(self.var_use_sw_trig.get())
             if self.basler is None:
                 self.basler = BaslerCamera(
                     device_index=desired_idx,
                     timeout_ms=desired_timeout,
-                    idle_reopen_sec=self.cam_idle_reopen_sec
+                    idle_reopen_sec=self.cam_idle_reopen_sec,
+                    use_sw_trigger=desired_sw_trig
                 )
                 self.basler.open()
             else:
@@ -1504,6 +1537,9 @@ class NotchApp(ttk.Window):
                     need_reopen=True
                 self.basler.timeout_ms = desired_timeout
                 self.basler.idle_reopen_sec = self.cam_idle_reopen_sec
+                if self.basler.use_sw_trigger != desired_sw_trig:
+                    self.basler.use_sw_trigger = desired_sw_trig
+                    need_reopen=True
                 if not self.basler.is_healthy():
                     need_reopen=True
                 if need_reopen:
@@ -1934,7 +1970,7 @@ class NotchApp(ttk.Window):
         plc_backoff=1.0; cam_backoff=1.0
         while True:
             try:
-                if self.cfg.auto_reconnect and not self.manual_disconnected:
+                if bool(self.var_auto_reconnect.get()) and not self.manual_disconnected:
                     # PLC 自動接続
                     if not self.plc_connected:
                         try:
@@ -1975,7 +2011,7 @@ class NotchApp(ttk.Window):
                                         time.sleep(cam_backoff)
 
                     # READY なら監視を自動開始（手動停止していないとき）
-                    if self.plc_connected and (self.basler is not None) and self.cfg.auto_watch_on_ready and not self.manual_stopped:
+                    if self.plc_connected and (self.basler is not None) and bool(self.var_auto_watch_on_ready.get()) and not self.manual_stopped:
                         if not (self.plc_thread and self.plc_thread.is_alive()):
                             self.on_plc_watch_start()
 
