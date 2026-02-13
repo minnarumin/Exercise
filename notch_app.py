@@ -520,6 +520,18 @@ class PLCClient:
             raise ValueError("empty PLC value")
         return int(float(text))
 
+    @staticmethod
+    def _parse_d_bit_device(device: str):
+        text = (device or "").strip()
+        m = re.fullmatch(r'([Dd]\d+)\.(\d+)', text)
+        if not m:
+            return None
+        word_dev = m.group(1).upper()
+        bit_index = int(m.group(2))
+        if not (0 <= bit_index <= 15):
+            raise ValueError(f"Dデバイスのビット番号は0..15で指定してください: {device}")
+        return word_dev, bit_index
+
     def connect(self, host:str, port:int):
         if not HAS_PYMC: raise RuntimeError("pymcprotocol 未導入")
         self.cli=pymcprotocol.Type3E(plctype="Q")
@@ -533,12 +545,29 @@ class PLCClient:
         self.cli=None
 
     def read_bit(self, head:str)->bool:
+        d_bit = self._parse_d_bit_device(head)
+        if d_bit is not None:
+            word_dev, bit_index = d_bit
+            vals=self.cli.batchread_wordunits(headdevice=word_dev, readsize=1)
+            raw = vals[0] if isinstance(vals,(list,tuple)) else vals
+            w = self._coerce_numeric(raw) & 0xFFFF
+            return bool((w >> bit_index) & 0x1)
         vals=self.cli.batchread_bitunits(headdevice=head, readsize=1)
         raw = vals[0] if isinstance(vals,(list,tuple)) else vals
         v=self._coerce_numeric(raw)
         return bool(v)
 
     def write_bit(self, head:str, value:bool):
+        d_bit = self._parse_d_bit_device(head)
+        if d_bit is not None:
+            word_dev, bit_index = d_bit
+            vals=self.cli.batchread_wordunits(headdevice=word_dev, readsize=1)
+            raw = vals[0] if isinstance(vals,(list,tuple)) else vals
+            w = self._coerce_numeric(raw) & 0xFFFF
+            mask = 1 << bit_index
+            w2 = (w | mask) if bool(value) else (w & (~mask & 0xFFFF))
+            self.cli.batchwrite_wordunits(headdevice=word_dev, values=[w2])
+            return
         self.cli.batchwrite_bitunits(headdevice=head, values=[1 if value else 0])
 
     def pulse_bit(self, head:str, ms:int=50):
