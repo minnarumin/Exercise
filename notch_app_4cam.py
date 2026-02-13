@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import re
 import logging
+from collections import deque
 
 LOGGER = logging.getLogger("notch_app_4cam")
 if not LOGGER.handlers:
@@ -283,6 +284,30 @@ def analyze_image(
 
 
 # ================== デバイス薄ラッパ ==================
+
+def list_basler_devices():
+    if not HAS_PYLYON:
+        return []
+    try:
+        tlf = pylon.TlFactory.GetInstance()
+        devs = tlf.EnumerateDevices()
+        out = []
+        for i, d in enumerate(devs):
+            model = ""
+            serial = ""
+            try:
+                model = d.GetModelName() or "Unknown"
+            except Exception:
+                model = "Unknown"
+            try:
+                serial = d.GetSerialNumber() or ""
+            except Exception:
+                serial = ""
+            label = f"{i}: {model}" + (f" (S/N:{serial})" if serial else "")
+            out.append((i, label))
+        return out
+    except Exception:
+        return []
 
 class BaslerCamera:
     def __init__(self, device_index=0, timeout_ms=3000, idle_reopen_sec=900, use_sw_trigger=True):
@@ -585,6 +610,11 @@ class NotchApp4Cam(ttk.Window):
         self.cam_panels = []
         self.cam_grab_stop = [threading.Event() for _ in range(4)]
         self.cam_grab_threads = [None, None, None, None]
+        self.cam_device_combos = []
+        self.cam_select_vars = []
+        self.camera_candidates = []
+        self.camera_label_to_index = {}
+        self._analysis_lines = deque(maxlen=5)
 
         self.var_plc_ip = tk.StringVar(value=self.cfg.plc_ip)
         self.var_plc_port = tk.IntVar(value=self.cfg.plc_port)
@@ -620,52 +650,20 @@ class NotchApp4Cam(ttk.Window):
                 "dev_err_an": tk.StringVar(value=c.dev_err_an),
                 "csv_filename": tk.StringVar(value=c.csv_filename),
             })
+            self.cam_select_vars.append(tk.StringVar(value=""))
 
         self._build_ui()
         self._bind_traces()
         self._post_status("起動完了")
 
     def _build_ui(self):
+        self._build_menu()
+
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
 
-        top = ttk.Labelframe(root, text="PLC共通設定", padding=8)
-        top.pack(fill="x")
-
-        r1 = ttk.Frame(top); r1.pack(fill="x", pady=2)
-        ttk.Label(r1, text="IP").pack(side="left")
-        ttk.Entry(r1, textvariable=self.var_plc_ip, width=16).pack(side="left", padx=4)
-        ttk.Label(r1, text="Port").pack(side="left")
-        ttk.Entry(r1, textvariable=self.var_plc_port, width=8).pack(side="left", padx=4)
-        ttk.Label(r1, text="Trig").pack(side="left")
-        ttk.Entry(r1, textvariable=self.var_dev_trig, width=10).pack(side="left", padx=4)
-
-        r2 = ttk.Frame(top); r2.pack(fill="x", pady=2)
-        ttk.Label(r2, text="DONE").pack(side="left")
-        ttk.Entry(r2, textvariable=self.var_dev_done, width=10).pack(side="left", padx=4)
-        ttk.Label(r2, text="BUSY").pack(side="left")
-        ttk.Entry(r2, textvariable=self.var_dev_busy, width=10).pack(side="left", padx=4)
-        ttk.Label(r2, text="ERR_TO").pack(side="left")
-        ttk.Entry(r2, textvariable=self.var_dev_err_to, width=10).pack(side="left", padx=4)
-        ttk.Label(r2, text="ERR_AN").pack(side="left")
-        ttk.Entry(r2, textvariable=self.var_dev_err_an, width=10).pack(side="left", padx=4)
-
-        r3 = ttk.Frame(top); r3.pack(fill="x", pady=2)
-        ttk.Checkbutton(r3, text="SWトリガ", variable=self.var_use_sw_trig).pack(side="left")
-        ttk.Label(r3, text="Timeout[ms]").pack(side="left", padx=(10, 2))
-        ttk.Entry(r3, textvariable=self.var_timeout_ms, width=8).pack(side="left")
-        ttk.Label(r3, text="DONE幅[ms]").pack(side="left", padx=(10, 2))
-        ttk.Entry(r3, textvariable=self.var_done_ms, width=8).pack(side="left")
-        ttk.Checkbutton(r3, text="自動再接続", variable=self.var_auto_reconnect).pack(side="left", padx=(12, 0))
-
-        r4 = ttk.Frame(top); r4.pack(fill="x", pady=2)
-        ttk.Label(r4, text="出力先").pack(side="left")
-        ttk.Entry(r4, textvariable=self.var_output_dir, width=45).pack(side="left", padx=4)
-        ttk.Label(r4, text="PLC保存先").pack(side="left")
-        ttk.Entry(r4, textvariable=self.var_plc_shot_dir, width=30).pack(side="left", padx=4)
-
         ops = ttk.Frame(root)
-        ops.pack(fill="x", pady=(8, 4))
+        ops.pack(fill="x", pady=(0, 4))
         ttk.Button(ops, text="PLC接続", command=self.on_plc_connect, bootstyle=SUCCESS).pack(side="left")
         ttk.Button(ops, text="PLC切断", command=self.on_plc_disconnect).pack(side="left", padx=4)
         ttk.Button(ops, text="監視開始", command=self.on_watch_start, bootstyle=PRIMARY).pack(side="left", padx=4)
@@ -678,13 +676,115 @@ class NotchApp4Cam(ttk.Window):
             nb.add(frm, text=f"Cam{i}")
             self._build_cam_tab(frm, v, i - 1)
 
-        self.txt_status = tk.Text(root, height=8, wrap="word", state="disabled")
-        self.txt_status.pack(fill="x", pady=(6, 0))
+        bottom = ttk.Frame(root)
+        bottom.pack(fill="x", pady=(6, 0))
+
+        status_box = ttk.Labelframe(bottom, text="ステータス", padding=4)
+        status_box.pack(side="left", fill="both", expand=True)
+        self.txt_status = tk.Text(status_box, height=8, wrap="word", state="disabled")
+        self.txt_status.pack(fill="both", expand=True)
+
+        analysis_box = ttk.Labelframe(bottom, text="解析結果(最新5件)", padding=4)
+        analysis_box.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        self.txt_analysis = tk.Text(analysis_box, height=8, wrap="word", state="disabled")
+        self.txt_analysis.pack(fill="both", expand=True)
+
+        self._refresh_camera_candidates()
+
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+
+        menu_setting = tk.Menu(menubar, tearoff=0)
+        menu_setting.add_command(label="PLC共通設定...", command=self._open_plc_common_settings)
+        menu_setting.add_command(label="設定を保存", command=lambda: (self._sync_cfg(), self.cfg.save(), self._post_status("設定を保存しました")))
+        menubar.add_cascade(label="設定", menu=menu_setting)
+
+        menu_cam = tk.Menu(menubar, tearoff=0)
+        menu_cam.add_command(label="接続カメラ再検出", command=self._refresh_camera_candidates)
+        menubar.add_cascade(label="カメラ", menu=menu_cam)
+
+        self.config(menu=menubar)
+
+    def _open_plc_common_settings(self):
+        win = tk.Toplevel(self)
+        win.title("PLC共通設定")
+        win.geometry("780x260")
+        win.transient(self)
+
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        r1 = ttk.Frame(frm); r1.pack(fill="x", pady=2)
+        ttk.Label(r1, text="IP").pack(side="left")
+        ttk.Entry(r1, textvariable=self.var_plc_ip, width=16).pack(side="left", padx=4)
+        ttk.Label(r1, text="Port").pack(side="left")
+        ttk.Entry(r1, textvariable=self.var_plc_port, width=8).pack(side="left", padx=4)
+        ttk.Label(r1, text="Trig").pack(side="left")
+        ttk.Entry(r1, textvariable=self.var_dev_trig, width=10).pack(side="left", padx=4)
+
+        r2 = ttk.Frame(frm); r2.pack(fill="x", pady=2)
+        ttk.Label(r2, text="DONE").pack(side="left")
+        ttk.Entry(r2, textvariable=self.var_dev_done, width=10).pack(side="left", padx=4)
+        ttk.Label(r2, text="BUSY").pack(side="left")
+        ttk.Entry(r2, textvariable=self.var_dev_busy, width=10).pack(side="left", padx=4)
+        ttk.Label(r2, text="ERR_TO").pack(side="left")
+        ttk.Entry(r2, textvariable=self.var_dev_err_to, width=10).pack(side="left", padx=4)
+        ttk.Label(r2, text="ERR_AN").pack(side="left")
+        ttk.Entry(r2, textvariable=self.var_dev_err_an, width=10).pack(side="left", padx=4)
+
+        r3 = ttk.Frame(frm); r3.pack(fill="x", pady=2)
+        ttk.Checkbutton(r3, text="SWトリガ", variable=self.var_use_sw_trig).pack(side="left")
+        ttk.Label(r3, text="Timeout[ms]").pack(side="left", padx=(10, 2))
+        ttk.Entry(r3, textvariable=self.var_timeout_ms, width=8).pack(side="left")
+        ttk.Label(r3, text="DONE幅[ms]").pack(side="left", padx=(10, 2))
+        ttk.Entry(r3, textvariable=self.var_done_ms, width=8).pack(side="left")
+        ttk.Checkbutton(r3, text="自動再接続", variable=self.var_auto_reconnect).pack(side="left", padx=(12, 0))
+
+        r4 = ttk.Frame(frm); r4.pack(fill="x", pady=2)
+        ttk.Label(r4, text="出力先").pack(side="left")
+        ttk.Entry(r4, textvariable=self.var_output_dir, width=45).pack(side="left", padx=4)
+        ttk.Label(r4, text="PLC保存先").pack(side="left")
+        ttk.Entry(r4, textvariable=self.var_plc_shot_dir, width=30).pack(side="left", padx=4)
+
+        r5 = ttk.Frame(frm); r5.pack(fill="x", pady=(10, 0))
+        ttk.Button(r5, text="保存して閉じる", bootstyle=PRIMARY, command=lambda: (self._sync_cfg(), self.cfg.save(), win.destroy())).pack(side="right")
+
+    def _refresh_camera_candidates(self):
+        cands = list_basler_devices()
+        if not cands:
+            cands = [(i, f"{i}: Camera{i+1}(未検出)") for i in range(4)]
+            self._post_status("接続カメラ検出: 0台（未検出表示で代替）")
+        else:
+            self._post_status(f"接続カメラ検出: {len(cands)}台")
+        self.camera_candidates = cands
+        self.camera_label_to_index = {label: idx for idx, label in cands}
+        labels = [label for _, label in cands]
+
+        for i in range(min(4, len(self.cam_select_vars))):
+            combo = self.cam_device_combos[i] if i < len(self.cam_device_combos) else None
+            if combo is not None:
+                combo.configure(values=labels)
+            idx = int(self.cam_vars[i]["camera_index"].get())
+            match = next((lab for n, lab in cands if n == idx), None)
+            if match is None:
+                match = labels[min(max(idx, 0), len(labels)-1)]
+                self.cam_vars[i]["camera_index"].set(self.camera_label_to_index.get(match, 0))
+            self.cam_select_vars[i].set(match)
+
+    def _on_cam_device_selected(self, cam_idx):
+        label = self.cam_select_vars[cam_idx].get()
+        idx = self.camera_label_to_index.get(label)
+        if idx is None:
+            return
+        self.cam_vars[cam_idx]["camera_index"].set(int(idx))
 
     def _build_cam_tab(self, parent, v, cam_idx):
         r1 = ttk.Frame(parent); r1.pack(fill="x", pady=2)
-        ttk.Label(r1, text="カメラインデックス").pack(side="left")
-        ttk.Entry(r1, textvariable=v["camera_index"], width=6).pack(side="left", padx=4)
+        ttk.Label(r1, text="カメラ選択").pack(side="left")
+        combo = ttk.Combobox(r1, textvariable=self.cam_select_vars[cam_idx], state="readonly", width=36)
+        combo.pack(side="left", padx=4)
+        combo.bind("<<ComboboxSelected>>", lambda _e, i=cam_idx: self._on_cam_device_selected(i))
+        self.cam_device_combos.append(combo)
         ttk.Checkbutton(r1, text="左右反転", variable=v["flip_horizontal"]).pack(side="left", padx=10)
 
         r2 = ttk.Frame(parent); r2.pack(fill="x", pady=2)
@@ -773,6 +873,12 @@ class NotchApp4Cam(ttk.Window):
             canvas.create_image(cw // 2, ch // 2, image=photo, anchor="center")
             panel["photo"] = photo
             panel["result_var"].set(result_text)
+            line = f"{time.strftime('%H:%M:%S')} | Cam{cam_idx+1} | {result_text}"
+            self._analysis_lines.appendleft(line)
+            self.txt_analysis.configure(state="normal")
+            self.txt_analysis.delete("1.0", "end")
+            self.txt_analysis.insert("1.0", "\n".join(self._analysis_lines))
+            self.txt_analysis.configure(state="disabled")
 
         self.after(0, _update)
 
