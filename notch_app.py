@@ -946,7 +946,7 @@ class NotchApp(ttk.Window):
         logframe=ttk.Frame(info_row)
         logframe.grid(row=0, column=0, sticky="nsew", padx=(0,6))
         ttk.Label(logframe, text="ステータス（最新5件）", bootstyle=INFO).pack(anchor="w")
-        self.txt_log=tk.Text(logframe, height=5, width=36, state="disabled", wrap="none")
+        self.txt_log=tk.Text(logframe, height=5, width=36, state="disabled", wrap="word")
         self.txt_log.pack(fill="both", expand=True)
 
         resultframe=ttk.Frame(info_row)
