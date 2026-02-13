@@ -507,6 +507,19 @@ class PLCClient:
     def __init__(self):
         self.cli=None
 
+    @staticmethod
+    def _coerce_numeric(value):
+        if isinstance(value, bool):
+            return 1 if value else 0
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        if isinstance(value, (float, np.floating)):
+            return int(value)
+        text = str(value).strip()
+        if not text:
+            raise ValueError("empty PLC value")
+        return int(float(text))
+
     def connect(self, host:str, port:int):
         if not HAS_PYMC: raise RuntimeError("pymcprotocol 未導入")
         self.cli=pymcprotocol.Type3E(plctype="Q")
@@ -521,7 +534,8 @@ class PLCClient:
 
     def read_bit(self, head:str)->bool:
         vals=self.cli.batchread_bitunits(headdevice=head, readsize=1)
-        v=int(vals[0]) if isinstance(vals,(list,tuple)) else int(vals)
+        raw = vals[0] if isinstance(vals,(list,tuple)) else vals
+        v=self._coerce_numeric(raw)
         return bool(v)
 
     def write_bit(self, head:str, value:bool):
@@ -534,7 +548,8 @@ class PLCClient:
 
     def read_word(self, head:str)->int:
         vals=self.cli.batchread_wordunits(headdevice=head, readsize=1)
-        v=int(vals[0]) if isinstance(vals,(list,tuple)) else int(vals)
+        raw = vals[0] if isinstance(vals,(list,tuple)) else vals
+        v=self._coerce_numeric(raw)
         return v & 0xFFFF
 
     def write_word(self, head:str, value:int):
