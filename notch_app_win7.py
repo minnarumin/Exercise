@@ -1842,7 +1842,8 @@ class NotchApp(ttk.Window):
             try:
                 interval=max(10, int(self.var_alive_ms.get()))
                 step=max(1, int(self.var_alive_step.get()))
-                self.hb_value=(self.hb_value+step)&0xFFFF
+                next_hb = self.hb_value + step
+                self.hb_value = 0 if next_hb > 9999 else next_hb
                 with self._plc_lock:
                     self.plc.write_word(self.var_dev_alive.get().strip(), self.hb_value)
             except Exception as e:
