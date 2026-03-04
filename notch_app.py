@@ -154,7 +154,7 @@ def list_basler_devices():
             except Exception:
                 serial=""
             label=f"{idx}: {model}" + (f" ({serial})" if serial else "")
-            results.append((idx, label))
+            results.append((idx, label, serial))
         return results
     except Exception:
         return []
@@ -400,11 +400,12 @@ def analyze_image(
 
 # ================== デバイス薄ラッパ ==================
 class BaslerCamera:
-    def __init__(self, device_index=0, timeout_ms=3000, idle_reopen_sec=900, use_sw_trigger=True):
+    def __init__(self, device_index=0, timeout_ms=3000, idle_reopen_sec=900, use_sw_trigger=True, preferred_serial=""):
         self.device_index=device_index
         self.timeout_ms=timeout_ms
         self.idle_reopen_sec=max(0, int(idle_reopen_sec))
         self.use_sw_trigger=bool(use_sw_trigger)
+        self.preferred_serial=(preferred_serial or "").strip()
         self.cam=None; self.converter=None
         self.last_snap_monotonic=0.0
 
@@ -413,7 +414,18 @@ class BaslerCamera:
         tlf=pylon.TlFactory.GetInstance()
         devs=tlf.EnumerateDevices()
         if not devs: raise RuntimeError("Basler カメラが見つかりません")
-        idx=min(max(0,self.device_index), len(devs)-1)
+        idx = None
+        if self.preferred_serial:
+            for i, dev in enumerate(devs):
+                try:
+                    if dev.GetSerialNumber() == self.preferred_serial:
+                        idx = i
+                        break
+                except Exception:
+                    continue
+        if idx is None:
+            idx=min(max(0,self.device_index), len(devs)-1)
+        self.device_index = idx
         self.cam=pylon.InstantCamera(tlf.CreateDevice(devs[idx]))
         self.cam.Open()
         self.converter=pylon.ImageFormatConverter()
@@ -627,6 +639,7 @@ class AppConfig:
 
     # カメラ設定
     camera_index: int = 0
+    camera_serial: str = ""
 
     # PLC 設定（メニューバーから編集）
     plc_ip: str = "192.168.1.2"
@@ -810,6 +823,7 @@ class NotchApp(ttk.Window):
         self.auto_preview=tk.BooleanVar(value=self.cfg.auto_preview)
         self.flip_horizontal=tk.BooleanVar(value=self.cfg.flip_horizontal)
         self.var_camera_index=tk.IntVar(value=self.cfg.camera_index)
+        self.var_camera_serial=tk.StringVar(value=self.cfg.camera_serial)
 
         # PLC/カメラ/ハートビート用
         self.plc=PLCClient()
@@ -1121,15 +1135,23 @@ class NotchApp(ttk.Window):
         if not devices:
             ttk.Label(frm, text="カメラが検出できません。pypylonの導入や接続を確認してください。", bootstyle=WARNING).pack(anchor="w", pady=(8,0))
             return
-        labels=[label for _idx, label in devices]
-        idx_map={label: idx for idx, label in devices}
+        labels=[label for _idx, label, _serial in devices]
+        info_map={label: (idx, serial) for idx, label, serial in devices}
         cmb=ttk.Combobox(frm, state="readonly", values=labels)
-        current_label=next((label for idx, label in devices if idx==self.var_camera_index.get()), labels[0])
+        current_label = None
+        wanted_serial = self.var_camera_serial.get().strip()
+        if wanted_serial:
+            current_label = next((label for idx, label, serial in devices if serial == wanted_serial), None)
+        if current_label is None:
+            current_label = next((label for idx, label, _serial in devices if idx==self.var_camera_index.get()), labels[0])
         cmb.set(current_label)
         cmb.pack(anchor="w", pady=(8,0))
         def on_select(_event=None):
             label=cmb.get()
-            self.var_camera_index.set(idx_map.get(label, 0))
+            idx, serial = info_map.get(label, (0, ""))
+            self.var_camera_index.set(idx)
+            self.var_camera_serial.set(serial or "")
+        on_select()
         cmb.bind("<<ComboboxSelected>>", on_select)
         ttk.Label(frm, text="変更は即保存されます。", bootstyle=INFO).pack(anchor="w", pady=(8,0))
 
@@ -1195,7 +1217,7 @@ class NotchApp(ttk.Window):
             self.var_use_sw_trig, self.var_timeout_ms, self.var_done_ms,
             self.var_dev_alive, self.var_alive_ms, self.var_alive_step, self.var_alive_auto,
             self.temp_max_files, self.var_temp_prefixes, self.csv_max_records, self.var_plc_shot_dir,
-            self.var_camera_index, self.var_auto_reconnect, self.var_auto_watch_on_ready
+            self.var_camera_index, self.var_camera_serial, self.var_auto_reconnect, self.var_auto_watch_on_ready
         )
 
         def bind_with_preview(v):
@@ -1238,6 +1260,7 @@ class NotchApp(ttk.Window):
         self.cfg.auto_preview=bool(self.auto_preview.get())
         self.cfg.flip_horizontal=bool(self.flip_horizontal.get())
         self.cfg.camera_index=int(self.var_camera_index.get())
+        self.cfg.camera_serial=self.var_camera_serial.get().strip()
         self.cfg.output_dir=self.output_dir or ""
         self.cfg.plc_ip=self.var_plc_ip.get().strip()
         self.cfg.plc_port=int(self.var_plc_port.get())
@@ -1451,6 +1474,7 @@ class NotchApp(ttk.Window):
     def _cam_open_if_needed(self):
         with self._cam_lock:
             desired_idx = int(self.var_camera_index.get())
+            desired_serial = self.var_camera_serial.get().strip()
             desired_timeout = int(self.var_timeout_ms.get())
             desired_sw_trig = bool(self.var_use_sw_trig.get())
             if self.basler is None:
@@ -1458,13 +1482,17 @@ class NotchApp(ttk.Window):
                     device_index=desired_idx,
                     timeout_ms=desired_timeout,
                     idle_reopen_sec=self.cam_idle_reopen_sec,
-                    use_sw_trigger=desired_sw_trig
+                    use_sw_trigger=desired_sw_trig,
+                    preferred_serial=desired_serial
                 )
                 self.basler.open()
             else:
                 need_reopen=False
                 if self.basler.device_index != desired_idx:
                     self.basler.device_index = desired_idx
+                    need_reopen=True
+                if self.basler.preferred_serial != desired_serial:
+                    self.basler.preferred_serial = desired_serial
                     need_reopen=True
                 self.basler.timeout_ms = desired_timeout
                 self.basler.idle_reopen_sec = self.cam_idle_reopen_sec
