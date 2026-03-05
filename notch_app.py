@@ -42,8 +42,18 @@ except Exception:
 
 
 # ================== ログ/障害調査支援 ==================
-LOG_PATH = os.path.join(os.path.expanduser("~"), "notch_app.log")
-FAULT_LOG_PATH = os.path.join(os.path.expanduser("~"), "notch_app_fault.log")
+def _runtime_base_dir():
+    try:
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(os.path.abspath(sys.executable))
+    except Exception:
+        pass
+    return os.path.dirname(os.path.abspath(__file__))
+
+LOG_DIR = os.path.join(_runtime_base_dir(), "Log")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_PATH = os.path.join(LOG_DIR, "notch_app.log")
+FAULT_LOG_PATH = os.path.join(LOG_DIR, "notch_app_fault.log")
 
 def _setup_logging():
     logger = logging.getLogger("notch_app")
